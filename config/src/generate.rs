@@ -3614,6 +3614,10 @@ pub struct GlobalConfig {
     // Device name for binding the BGP listener socket.
     #[serde(rename = "bind-to-device")]
     pub bind_to_device: Option<String>,
+    /// Place an eBGP export path ahead of each received AS path when a
+    /// generation is compacted. Absent and false leave received paths unchanged.
+    #[serde(default, rename = "as-path-export-tail")]
+    pub as_path_export_tail: bool,
 }
 // struct for container bgp:global.
 // Global configuration for the BGP router.

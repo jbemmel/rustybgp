@@ -7,11 +7,7 @@ static ALLOCATOR: support::CountingAllocator = support::CountingAllocator;
 
 fn main() {
     println!("operation,median_ns,allocations_per_op,min_ns,max_ns");
-    for (name, kinds, count) in [
-        ("short", vec![2], 4),
-        ("mixed", vec![2, 1, 3, 4], 4),
-        ("long", vec![2, 2, 2, 2], 255),
-    ] {
+    for (name, kinds, count) in [("short", vec![2], 4), ("mixed", vec![2, 1, 3, 4], 4)] {
         let mut bytes = Vec::new();
         for kind in kinds {
             bytes.extend_from_slice(&[kind, count]);

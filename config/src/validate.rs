@@ -391,6 +391,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn as_path_export_tail_is_off_unless_enabled() {
+        let omitted: GlobalConfig = toml::from_str("as = 65001\n").unwrap();
+        assert!(!omitted.as_path_export_tail);
+        let disabled: GlobalConfig = toml::from_str("as-path-export-tail = false\n").unwrap();
+        assert!(!disabled.as_path_export_tail);
+        let enabled: GlobalConfig = toml::from_str("as-path-export-tail = true\n").unwrap();
+        assert!(enabled.as_path_export_tail);
+    }
+
     fn neighbor(peer_group: Option<&str>, peer_as: Option<u32>, addr: Option<&str>) -> Neighbor {
         Neighbor {
             config: Some(NeighborConfig {

@@ -109,9 +109,8 @@ One pinned process with the feature off, from
 [traversal-default.csv](benchmarks/packed-as-path/traversal-default.csv).
 Three pinned processes with the feature on, after prepend learned to copy
 canonical storage and to splice a 16-bit AS number onto packed storage. The
-table uses the median of those three process medians. Short and mixed paths in
-this bench are half wide ASNs, so they stay canonical. The long path is four
-255-member segments and is packed, because two thirds of its ASNs fit in 16 bits.
+table uses the median of those three process medians. These paths are half
+wide ASNs, so they stay in the canonical layout.
 
 | Operation | Feature off, ns | Feature on, ns | Allocations per operation |
 | --- | ---: | ---: | ---: |
@@ -120,18 +119,61 @@ this bench are half wide ASNs, so they stay canonical. The long path is four
 | short/wire_encode | 32.71 | 17.04 | 2 → 1 |
 | mixed/prepend | 20.82 | 62.45 | 1 → 2 |
 | mixed/wire_encode | 63.20 | 17.79 | 2 → 1 |
-| long/borrowed_summary | 9.00 | 8.14 | 0 → 0 |
-| long/prepend | 61.92 | 4,321.11 | 1 → 2 |
-| long/wire_encode | 102.80 | 3,036.84 | 2 → 1 |
-| long/borrowed_decode | 388.34 | 1,696.11 | 0 → 0 |
 
 Enabled rounds:
 [1](benchmarks/packed-as-path/traversal-enabled-1.csv),
 [2](benchmarks/packed-as-path/traversal-enabled-2.csv),
 [3](benchmarks/packed-as-path/traversal-enabled-3.csv).
 A cached summary on a retained entry is 4.25 ns in
-[store.csv](benchmarks/packed-as-path/store.csv). Decoding a packed long path,
-and expanding one to the wire, still walks every ASN.
+[store.csv](benchmarks/packed-as-path/store.csv).
+
+## Compaction
+
+`AsPathStore::compact_attributes` is a synchronous, quiescent checkpoint.
+The table supplies every route's imported and original attribute owner while
+holding its shard lock. The bounded weak interning accelerator is not a live
+route registry. Inserts and withdrawals resume after build and adoption finish;
+queued readers can continue using immutable old entries. The store does not
+strongly retain generations or withdrawn entries. A remaining reader of one
+slice retains its whole arena until it releases that entry.
+
+Segment types, counts, repetitions, empty segments, ASN zero fallback and
+canonical equality remain exact. Short contiguous ASN windows and requested
+long suffixes can share direct offsets, with separate segment shapes. Long
+internal windows are deliberately not exhaustively indexed. The deterministic
+order is descending payload length followed by exact canonical bytes.
+
+The final Arc allocation includes up to 63 padding bytes. Its data region is
+aligned using the allocation's actual address. Every slice of at most 64 bytes
+is checked for containment, including slices reused inside long paths. Longer
+raw paths remain contiguous and can cross lines. Relative placement is
+reproducible; allocation-dependent leading padding can change descriptor offsets.
+Capacity errors and exceeded build budgets discard the build before adoption.
+
+Publication compares requested allocation bytes for actual PathEntry objects,
+Arc controls, payload allocations (counted once), shapes, and alignment padding.
+The existing bounded accelerator allocation is reused. Allocator bookkeeping and
+rounding are excluded; these figures are not process RSS. The outcome separately
+reports a conservative scratch estimate and an estimated old-plus-new transition
+footprint. These exclude unrelated queued readers and older arenas those readers
+retain. Attribute-vector copies during adoption preserve prefix fanout sharing;
+the scratch estimate charges their payloads. No global resident-memory bound is
+claimed while external readers retain arbitrary old generations.
+
+Defaults limit a checkpoint to one million attribute owners, a conservative
+256 MiB scratch reservation, a 32 MiB arena and a two-second build deadline.
+Slice hashing and comparison work is also bounded. The deadline is checked before
+publication; adoption must finish once begun. Table checkpoints currently run at
+configuration application, synchronously per shard. Background publication and
+runtime tuning of checkpoint budgets remain follow-up work. This can pause table
+operations and is not a demonstrated performance improvement.
+
+`as-path-export-tail` in the global config defaults to false. Enabling it permits
+synthetic local-AS prefix placement candidates; it never changes received route
+semantics. These candidates are an arena placement heuristic, not peer-specific
+wire export caching. Existing export transformations remain authoritative for
+confederations, route servers, iBGP and prepend policy. Invalid synthetic ASN or
+segment-kind options discard the build.
 
 ## Reproduction
 
@@ -151,7 +193,25 @@ cargo bench -p rustybgp-table --bench path_store_replay --features packed-as-pat
 # path_store_replay <shards> <workers> <iterations>
 ```
 
-Source hashes for the files that define this behavior are in
+The recorded PR 2 measurements identify their source files in
 [source-signatures.json](benchmarks/packed-as-path/source-signatures.json).
+Those measurements do not benchmark the new checkpoint implementation.
 The feature stays off until a workload with repeated paths pays for the slower
 parse, policy walk, and long-path export.
+
+## Checkpoint validation
+
+On 2026-10-17, the workspace tests passed with packed paths enabled (1,342
+passed, 26 ignored) and with default features (1,324 passed, 26 ignored).
+Clippy passed for all workspace targets in both configurations with warnings
+denied; formatting and diff whitespace checks passed. The feature-enabled
+GoBGP gRPC smoke test passed all 11 checks. That smoke test validates daemon
+integration, not compaction on a full RIB.
+
+Checkpoint-specific tests cover a complete live set larger than its weak cache,
+withdrawn entry reclamation, held old readers, deterministic relative placement,
+attribute fanout, original/import attribute adoption, mixed ASN widths, ASN zero,
+segment rollover, confederation slices, exact wire reconstruction, actual-address
+cache containment, descriptor capacity errors, default-off export candidates and
+unchanged state on rejected builds. Full-snapshot checkpoint build time, RSS and
+lookup performance have not yet been measured.

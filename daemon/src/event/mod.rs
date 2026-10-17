@@ -987,6 +987,17 @@ impl Global {
             }
         }
 
+        #[cfg(feature = "packed-as-paths")]
+        {
+            let export_asn = config
+                .global
+                .as_ref()
+                .and_then(|global| global.config.as_ref())
+                .filter(|config| config.as_path_export_tail)
+                .and_then(|_| (self.asn != 0).then_some(self.asn));
+            tables.compact_as_paths(export_asn);
+        }
+
         Ok(self.asn != 0)
     }
 

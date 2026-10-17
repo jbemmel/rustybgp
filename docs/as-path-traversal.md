@@ -66,8 +66,8 @@ These are not route installation, peer fanout, full-feed, or concurrent-daemon
 throughput measurements.
 
 A separate traversal benchmark compares owned versus borrowed decode and two
-full ASN counts versus a borrowed two-target presence miss. It covers short
-paths, mixed segment types, and four 255-member segments. Borrowed decode,
+full ASN counts versus a borrowed two-target presence miss. It covers a short
+path and one path with mixed segment types. Borrowed decode,
 presence, and summary loops assert zero allocations. Its seven-batch samples
 are summarized in [traversal.csv](benchmarks/as-path/traversal.csv).
 

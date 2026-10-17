@@ -1424,6 +1424,13 @@ impl Attribute {
     /// Retain canonical storage if validation/capacity prevents interning; packet
     /// acceptance is unchanged. Called once before an UPDATE's prefix fanout.
     #[cfg(feature = "packed-as-paths")]
+    pub(crate) fn retarget_as_path(&mut self, entry: Arc<crate::as_path_store::PathEntry>) {
+        if self.code == Self::AS_PATH {
+            self.data = AttributeData::PackedPath(entry);
+        }
+    }
+
+    #[cfg(feature = "packed-as-paths")]
     pub fn intern_as_path(&mut self, store: &mut crate::as_path_store::AsPathStore) {
         if self.code != Self::AS_PATH {
             return;
@@ -1455,6 +1462,15 @@ impl Attribute {
             AttributeData::Bin(_) | AttributeData::Opaque(_) => None,
             #[cfg(feature = "packed-as-paths")]
             AttributeData::PackedPath(_) => None,
+        }
+    }
+
+    /// Bytes allocated when cloning this attribute during checkpoint adoption.
+    #[cfg(feature = "packed-as-paths")]
+    pub(crate) fn clone_allocation_bytes(&self) -> usize {
+        match &self.data {
+            AttributeData::Bin(v) | AttributeData::Opaque(v) => v.len(),
+            _ => 0,
         }
     }
 
@@ -2110,7 +2126,7 @@ impl Attribute {
                 } else {
                     dst.put_u8(entry.canonical_len() as u8);
                 }
-                if entry.is_compact() {
+                if entry.is_compact() || entry.external_shapes() {
                     for segment in entry.as_path().segments() {
                         dst.put_u8(segment.kind());
                         dst.put_u8(segment.len() as u8);

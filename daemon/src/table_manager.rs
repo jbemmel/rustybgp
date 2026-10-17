@@ -141,6 +141,14 @@ impl TableManager {
     /// First available MPLS label (0-15 are reserved per RFC 3032).
     const LABEL_BASE: u32 = 16;
 
+    /// Compact each shard's packed AS paths. The receive path does not call this.
+    #[cfg(feature = "packed-as-paths")]
+    pub(crate) fn compact_as_paths(&self, export_asn: Option<u32>) {
+        for shard in &self.shards {
+            shard.lock().unwrap().rtable.compact_as_paths(export_asn);
+        }
+    }
+
     pub(crate) fn new(num_shards: usize) -> Self {
         let vrfs: SharedVrfs = Arc::new(ArcSwap::new(Arc::new(FnvHashMap::default())));
         TableManager {

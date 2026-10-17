@@ -30,6 +30,10 @@ pub struct AsPath<'a> {
     bytes: &'a [u8],
     encoding: Encoding,
     summary: Option<AsPathSummary>,
+    /// When set, `bytes` are ASN payloads and these headers describe them.
+    /// Absent means each segment header is inline at the start of its bytes.
+    #[cfg(feature = "packed-as-paths")]
+    shapes: Option<&'a [(u8, u8)]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,15 +69,30 @@ impl<'a> AsPath<'a> {
             bytes,
             encoding: Encoding::Canonical,
             summary: None,
+            #[cfg(feature = "packed-as-paths")]
+            shapes: None,
         })
     }
 
     #[cfg(feature = "packed-as-paths")]
     pub(crate) fn stored(bytes: &'a [u8], encoding: Encoding, summary: AsPathSummary) -> Self {
+        Self::stored_shaped(bytes, encoding, Some(summary), None)
+    }
+
+    /// `shapes` is one `(segment type, member count)` per segment. The payload
+    /// holds only encoded ASNs, in segment order.
+    #[cfg(feature = "packed-as-paths")]
+    pub(crate) fn stored_shaped(
+        bytes: &'a [u8],
+        encoding: Encoding,
+        summary: Option<AsPathSummary>,
+        shapes: Option<&'a [(u8, u8)]>,
+    ) -> Self {
         Self {
             bytes,
             encoding,
-            summary: Some(summary),
+            summary,
+            shapes,
         }
     }
 
@@ -90,6 +109,8 @@ impl<'a> AsPath<'a> {
         AsPathSegments {
             rest: self.bytes,
             encoding: self.encoding,
+            #[cfg(feature = "packed-as-paths")]
+            shapes: self.shapes,
         }
     }
 
@@ -226,12 +247,32 @@ fn decode(bytes: &[u8], encoding: Encoding) -> (u32, usize) {
 pub struct AsPathSegments<'a> {
     rest: &'a [u8],
     encoding: Encoding,
+    #[cfg(feature = "packed-as-paths")]
+    shapes: Option<&'a [(u8, u8)]>,
 }
 
 impl<'a> Iterator for AsPathSegments<'a> {
     type Item = AsPathSegment<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(feature = "packed-as-paths")]
+        if let Some(shapes) = self.shapes {
+            let (kind, count) = *shapes.first()?;
+            let count = usize::from(count);
+            let mut size = 0;
+            for _ in 0..count {
+                size += decode(&self.rest[size..], self.encoding).1;
+            }
+            let (segment, rest) = self.rest.split_at(size);
+            self.rest = rest;
+            self.shapes = Some(&shapes[1..]);
+            return Some(AsPathSegment {
+                kind,
+                bytes: segment,
+                count,
+                encoding: self.encoding,
+            });
+        }
         if self.rest.is_empty() {
             return None;
         }

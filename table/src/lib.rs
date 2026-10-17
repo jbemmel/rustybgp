@@ -1197,6 +1197,38 @@ impl Table {
             .filter(|d| !d.paths.is_empty())
     }
 
+    /// Publish a smaller packed-path generation for this shard. Callers run
+    /// this off the receive path. Route records adopt the new entries in
+    /// place and no route update is emitted.
+    #[cfg(feature = "packed-as-paths")]
+    pub fn compact_as_paths(
+        &mut self,
+        export_asn: Option<u32>,
+    ) -> packet::as_path_store::CompactOutcome {
+        let options = packet::as_path_store::CompactOptions {
+            export_tail: export_asn.map(|asn| packet::as_path_store::ExportTail {
+                asn,
+                kind: bgp::Attribute::AS_PATH_TYPE_SEQ,
+            }),
+            ..Default::default()
+        };
+        // The shard lock and &mut self make this an explicit quiescent
+        // checkpoint. Include every RIB entry, including pre-policy attributes.
+        let mut owners = Vec::new();
+        for rib in self.ribs.values_mut() {
+            for destination in rib.destinations.values_mut() {
+                for entry in &mut destination.entry {
+                    if owners.len().saturating_add(2) > options.max_owners {
+                        return packet::as_path_store::CompactOutcome::Discarded;
+                    }
+                    owners.push(&mut entry.path.attr);
+                    owners.push(&mut entry.original_attr);
+                }
+            }
+        }
+        self.path_store.compact_attributes(&mut owners, options)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
@@ -6588,5 +6620,60 @@ mod tests {
             0,
             "lowest freed local_id must be reused"
         );
+    }
+    #[cfg(feature = "packed-as-paths")]
+    #[test]
+    fn packed_checkpoint_adopts_original_and_import_paths_without_route_changes() {
+        let mut rt = Table::new(0);
+        let peer = source(1, 65001, 65000, 1);
+        for i in 1..=64u8 {
+            let mut raw = vec![2, 4];
+            for asn in [u32::from(i), 65535, 65536, 9] {
+                raw.extend_from_slice(&asn.to_be_bytes());
+            }
+            let attrs = Arc::new(vec![
+                bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, raw).unwrap(),
+            ]);
+            rt.insert(
+                peer.clone(),
+                Family::IPV4,
+                nlri(10, 0, i, 0, 24),
+                0,
+                nh(),
+                attrs,
+                None,
+                false,
+                false,
+                None,
+                0,
+            );
+        }
+        let held: Vec<_> = rt
+            .ribs
+            .values()
+            .flat_map(|r| r.destinations.values())
+            .flat_map(|d| &d.entry)
+            .map(|e| Arc::clone(&e.path.attr))
+            .collect();
+        let result = rt.compact_as_paths(None);
+        assert!(
+            matches!(
+                result,
+                packet::as_path_store::CompactOutcome::Published { .. }
+            ),
+            "{result:?}"
+        );
+        for entry in rt
+            .ribs
+            .values()
+            .flat_map(|r| r.destinations.values())
+            .flat_map(|d| &d.entry)
+        {
+            assert!(Arc::ptr_eq(&entry.path.attr, &entry.original_attr));
+            let old = held.iter().find(|a| ***a == *entry.path.attr).unwrap();
+            assert_eq!(**old, *entry.path.attr);
+            assert!(!Arc::ptr_eq(old, &entry.path.attr));
+        }
+        assert_eq!(held.len(), 64);
     }
 }

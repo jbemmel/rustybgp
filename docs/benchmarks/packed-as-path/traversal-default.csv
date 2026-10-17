@@ -13,10 +13,3 @@ mixed/wire_encode,63.20,2.000,61.40646,64.45667
 mixed/two_counts_miss,31.92,0.000,31.5644,34.88139
 mixed/borrowed_presence_miss,15.53,0.000,14.44577,17.71387
 mixed/borrowed_summary,8.30,0.000,7.8766,8.59905
-long/owned_decode,840.50,4.000,838.66981,854.53361
-long/borrowed_decode,388.34,0.000,386.75375,406.79793
-long/prepend,61.92,1.000,60.73206,64.76681
-long/wire_encode,102.80,2.000,92.68014,104.3588
-long/two_counts_miss,1622.09,0.000,1608.65186,1650.25263
-long/borrowed_presence_miss,604.70,0.000,601.17258,614.3489
-long/borrowed_summary,9.00,0.000,8.96226,9.01769

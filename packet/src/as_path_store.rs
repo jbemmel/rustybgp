@@ -14,17 +14,19 @@
 // limitations under the License.
 
 //! Receive-local, bounded weak interning. Entries outlive the store through Arc.
-//! No mutable arena, decoded cache, relocation, or global receive-path lock.
+//! Compaction builds a new arena off to the side and publishes it only when it
+//! is smaller. There is no lock on the receive path.
 use crate::as_path::{AsPath, AsPathSummary, Encoding, MalformedAsPath};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 const LENGTH_ESCAPE: u32 = 127;
 const MAX_OFFSET_UNITS: usize = (1 << 25) - 1;
 
-/// Common four-byte descriptor. Exceptional lengths live in the owning entry's
-/// byte slice length. Each PR 2 entry owns one immutable allocation (offset zero).
+/// Common four-byte descriptor. Exceptional lengths use the owning entry's
+/// stored_len. Private allocations start at zero; checkpoint entries use slices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathDescriptor(u32);
 
@@ -62,7 +64,12 @@ pub enum StoreError {
 #[derive(Debug)]
 pub struct PathEntry {
     descriptor: PathDescriptor,
-    bytes: Box<[u8]>,
+    /// Private encoding, or a shared generation arena.
+    bytes: Arc<[u8]>,
+    /// Length of this path's slice. The arena may be longer.
+    stored_len: usize,
+    /// Segment headers when `bytes` holds ASN payloads only.
+    shapes: Option<Box<[(u8, u8)]>>,
     canonical_len: usize,
     canonical_hash: u64,
     encoding: Encoding,
@@ -102,28 +109,35 @@ impl PathEntry {
         } else {
             canonical.into()
         };
-        Ok(Self {
-            descriptor: PathDescriptor::new(0, bytes.len())?,
-            bytes,
-            canonical_len: canonical.len(),
-            canonical_hash: content_hash(canonical),
-            encoding: if compact {
-                Encoding::Escaped
-            } else {
-                Encoding::Canonical
-            },
+        let encoding = if compact {
+            Encoding::Escaped
+        } else {
+            Encoding::Canonical
+        };
+        Self::assemble(
+            bytes.into_vec(),
+            canonical.len(),
+            content_hash(canonical),
+            encoding,
             summary,
-        })
+        )
     }
 
     pub fn descriptor(&self) -> PathDescriptor {
         self.descriptor
     }
     pub fn stored_bytes(&self) -> usize {
-        self.bytes.len()
+        self.stored_len
     }
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.slice()
+    }
+    fn slice(&self) -> &[u8] {
+        let offset = self.descriptor.offset();
+        &self.bytes[offset..offset + self.stored_len]
+    }
+    pub(crate) fn external_shapes(&self) -> bool {
+        self.shapes.is_some()
     }
 
     /// Build the path that results from prepending one AS number.
@@ -133,17 +147,25 @@ impl PathEntry {
     /// The previous entry is left unchanged.
     pub(crate) fn prepended(&self, kind: u8, asn: u32) -> Result<Self, StoreError> {
         let narrow = (1..=u16::MAX as u32).contains(&asn);
+        if self.shapes.is_some() {
+            return self.prepend_from_view(kind, asn);
+        }
         if !self.is_compact() {
-            let merge = !self.bytes.is_empty() && self.bytes[0] == kind && self.bytes[1] < 255;
-            let mut canonical = Vec::with_capacity(self.bytes.len() + if merge { 4 } else { 6 });
-            canonical.extend_from_slice(&[kind, if merge { self.bytes[1] + 1 } else { 1 }]);
+            let bytes = self.slice();
+            let merge = !bytes.is_empty() && bytes[0] == kind && bytes[1] < 255;
+            let mut canonical = Vec::with_capacity(bytes.len() + if merge { 4 } else { 6 });
+            canonical.extend_from_slice(&[kind, if merge { bytes[1] + 1 } else { 1 }]);
             canonical.extend_from_slice(&asn.to_be_bytes());
-            canonical.extend_from_slice(if merge { &self.bytes[2..] } else { &self.bytes });
+            canonical.extend_from_slice(if merge { &bytes[2..] } else { bytes });
             return Self::from_canonical_bytes(canonical, self.summary_after_prepend(kind, asn));
         }
         if narrow {
             return self.prepend_compact(kind, asn);
         }
+        self.prepend_from_view(kind, asn)
+    }
+
+    fn prepend_from_view(&self, kind: u8, asn: u32) -> Result<Self, StoreError> {
         let mut canonical = Vec::with_capacity(self.canonical_len + 6);
         let mut segments = self.as_path().segments();
         let first = segments.next();
@@ -167,12 +189,13 @@ impl PathEntry {
     }
 
     fn prepend_compact(&self, kind: u8, asn: u32) -> Result<Self, StoreError> {
-        let merge = !self.bytes.is_empty() && self.bytes[0] == kind && self.bytes[1] < 255;
-        let mut packed = Vec::with_capacity(self.bytes.len() + if merge { 2 } else { 4 });
+        let bytes = self.slice();
+        let merge = !bytes.is_empty() && bytes[0] == kind && bytes[1] < 255;
+        let mut packed = Vec::with_capacity(bytes.len() + if merge { 2 } else { 4 });
         packed.push(kind);
-        packed.push(if merge { self.bytes[1] + 1 } else { 1 });
+        packed.push(if merge { bytes[1] + 1 } else { 1 });
         packed.extend_from_slice(&(asn as u16).to_be_bytes());
-        packed.extend_from_slice(if merge { &self.bytes[2..] } else { &self.bytes });
+        packed.extend_from_slice(if merge { &bytes[2..] } else { bytes });
         let summary = self.summary_after_prepend(kind, asn);
         let canonical_len = self.canonical_len + if merge { 4 } else { 6 };
         let hash = hash_expanded(&packed, canonical_len);
@@ -206,9 +229,12 @@ impl PathEntry {
         encoding: Encoding,
         summary: AsPathSummary,
     ) -> Result<Self, StoreError> {
+        let stored_len = bytes.len();
         Ok(Self {
-            descriptor: PathDescriptor::new(0, bytes.len())?,
-            bytes: bytes.into_boxed_slice(),
+            descriptor: PathDescriptor::new(0, stored_len)?,
+            bytes: Arc::from(bytes),
+            stored_len,
+            shapes: None,
             canonical_len,
             canonical_hash,
             encoding,
@@ -222,15 +248,11 @@ impl PathEntry {
         matches!(self.encoding, Encoding::Escaped)
     }
     pub fn as_path(&self) -> AsPath<'_> {
-        let offset = self.descriptor.offset();
-        let length = self
-            .descriptor
-            .inline_length()
-            .unwrap_or(self.bytes.len() - offset);
-        AsPath::stored(
-            &self.bytes[offset..offset + length],
+        AsPath::stored_shaped(
+            self.slice(),
             self.encoding,
-            self.summary,
+            Some(self.summary),
+            self.shapes.as_deref(),
         )
     }
     pub(crate) fn fingerprint(&self) -> u64 {
@@ -399,6 +421,452 @@ impl AsPathStore {
         let entry = Arc::new(PathEntry::new(canonical)?);
         self.remember(hash, &entry);
         Ok(entry)
+    }
+
+    /// Quiescent checkpoint over a complete set of route attribute owners.
+    /// Callers exclude inserts/withdrawals until this returns. Old readers keep
+    /// immutable entries; the store never strongly owns published entries.
+    pub fn compact_attributes(
+        &mut self,
+        attributes: &mut [&mut Arc<Vec<crate::bgp::Attribute>>],
+        options: CompactOptions,
+    ) -> CompactOutcome {
+        let started = Instant::now();
+        if attributes.len() > options.max_owners {
+            return CompactOutcome::Discarded;
+        }
+        let mut live = Vec::new();
+        let mut seen = HashSet::new();
+        let mut seen_owners = HashSet::new();
+        let mut charge = attributes.len().saturating_mul(256);
+        for owner in attributes.iter() {
+            if seen_owners.insert(Arc::as_ptr(owner)) {
+                charge = charge.saturating_add(std::mem::size_of_val(owner.as_slice()));
+                for attr in owner.iter() {
+                    charge = charge.saturating_add(attr.clone_allocation_bytes());
+                }
+                if charge > options.max_scratch_bytes {
+                    return CompactOutcome::Discarded;
+                }
+            }
+            for attr in owner.iter() {
+                if let Some(entry) = attr.packed_as_path()
+                    && seen.insert(Arc::as_ptr(entry))
+                {
+                    // Conservative reservation estimate for candidates, exact
+                    // keys, bounds, temporary encodings and builder indices.
+                    charge = charge.saturating_add(entry.canonical_len.saturating_mul(2048) + 2048);
+                    if charge > options.max_scratch_bytes
+                        || started.elapsed() > options.max_duration
+                    {
+                        return CompactOutcome::Discarded;
+                    }
+                    live.push(Arc::clone(entry));
+                }
+            }
+        }
+        if live.is_empty() {
+            return CompactOutcome::Discarded;
+        }
+        let before = footprint(&live);
+        // Canonical bytes, not fingerprints, determine identity and ordering.
+        let mut unique = BTreeMap::new();
+        for entry in &live {
+            let Some(candidate) = Candidate::from_entry(entry) else {
+                return CompactOutcome::Discarded;
+            };
+            unique.entry(entry.canonical_bytes()).or_insert(candidate);
+        }
+        if let Some(tail) = options.export_tail {
+            if tail.asn == 0 || !matches!(tail.kind, 2 | 3) {
+                return CompactOutcome::Discarded;
+            }
+            let mut exports = Vec::new();
+            for candidate in unique.values() {
+                let Some(exported) = candidate.with_export_tail(tail) else {
+                    return CompactOutcome::Discarded;
+                };
+                let key = exported.canonical_bytes();
+                exports.push((key, exported));
+            }
+            for (key, candidate) in exports {
+                unique.entry(key).or_insert(candidate);
+            }
+        }
+        let mut candidates: Vec<_> = unique.into_iter().collect();
+        candidates.sort_by(|(ka, a), (kb, b)| {
+            b.payload
+                .len()
+                .cmp(&a.payload.len())
+                .then_with(|| ka.cmp(kb))
+        });
+        let mut arena = Arena {
+            requested: candidates
+                .iter()
+                .map(|(_, c)| (content_hash(&c.payload), c.payload.len()))
+                .collect(),
+            long_lengths: candidates
+                .iter()
+                .map(|(_, c)| c.payload.len())
+                .filter(|&n| n > LINE)
+                .collect(),
+            work_remaining: options.max_scratch_bytes,
+            ..Default::default()
+        };
+        let mut placed = Vec::new();
+        let mut shared_slices = 0;
+        for (_, candidate) in &candidates {
+            if started.elapsed() > options.max_duration {
+                return CompactOutcome::Discarded;
+            }
+            let Some((offset, shared)) = arena.place(
+                &candidate.payload,
+                &candidate.bounds,
+                options.max_arena_bytes,
+            ) else {
+                return CompactOutcome::Discarded;
+            };
+            placed.push(offset);
+            shared_slices += usize::from(shared);
+        }
+        // Arc<[u8]> itself need not be line aligned. Reserve padding, then align
+        // the data inside the final allocation (no moving allocation afterwards).
+        let mut bytes: Arc<[u8]> = vec![0; arena.buf.len() + LINE - 1].into();
+        let prefix = (LINE - bytes.as_ptr() as usize % LINE) % LINE;
+        Arc::get_mut(&mut bytes).unwrap()[prefix..prefix + arena.buf.len()]
+            .copy_from_slice(&arena.buf);
+        let mut built = BTreeMap::new();
+        for ((key, candidate), offset) in candidates.iter().zip(placed) {
+            let Ok(entry) = candidate.entry(Arc::clone(&bytes), offset + prefix) else {
+                return CompactOutcome::Discarded;
+            };
+            if entry.canonical_bytes() != *key {
+                return CompactOutcome::Discarded;
+            }
+            built.insert(key.clone(), Arc::new(entry));
+        }
+        let entries: Vec<_> = built.values().cloned().collect();
+        let after = footprint(&entries);
+        if after >= before || started.elapsed() > options.max_duration {
+            return CompactOutcome::Discarded;
+        }
+        // Cache transformed attribute vectors by the original allocation so
+        // prefix fanout and original/import attribute sharing are preserved.
+        let mut adopted = HashMap::new();
+        for owner in attributes.iter_mut() {
+            let key = Arc::as_ptr(owner);
+            let replacement = adopted.entry(key).or_insert_with(|| {
+                let mut updated = Arc::clone(owner);
+                for i in 0..updated.len() {
+                    if let Some(old) = updated[i].packed_as_path()
+                        && let Some(new) = built.get(&old.canonical_bytes())
+                    {
+                        let mut attr = updated[i].clone();
+                        attr.retarget_as_path(Arc::clone(new));
+                        Arc::make_mut(&mut updated)[i] = attr;
+                    }
+                }
+                updated
+            });
+            **owner = Arc::clone(replacement);
+        }
+        // Keep the accelerator bounded. Evicted live entries still resolve
+        // through route ownership and will be included in the next checkpoint.
+        let accelerator_limit = self.max_records.min(self.entries.capacity());
+        self.entries.clear();
+        for entry in entries.iter().take(accelerator_limit) {
+            self.remember(entry.fingerprint(), entry);
+        }
+        CompactOutcome::Published {
+            entries: entries.len(),
+            shared_slices,
+            before_bytes: before,
+            after_bytes: after,
+            arena_bytes: bytes.len(),
+            scratch_bytes_estimate: charge,
+            transition_bytes_estimate: before.saturating_add(after).saturating_add(charge),
+        }
+    }
+}
+
+const LINE: usize = 64;
+
+/// Requested allocation bytes, excluding allocator rounding/bookkeeping and
+/// the unchanged accelerator. Count each allocation once, even for slices.
+fn footprint(entries: &[Arc<PathEntry>]) -> usize {
+    let mut seen_entries = HashSet::new();
+    let mut seen_payloads = HashSet::new();
+    let mut bytes = 0;
+    for entry in entries {
+        if !seen_entries.insert(Arc::as_ptr(entry)) {
+            continue;
+        }
+        bytes += std::mem::size_of::<PathEntry>() + 2 * std::mem::size_of::<usize>();
+        bytes += entry
+            .shapes
+            .as_ref()
+            .map_or(0, |s| std::mem::size_of_val(s.as_ref()));
+        if seen_payloads.insert(Arc::as_ptr(&entry.bytes) as *const u8) {
+            bytes += entry.bytes.len() + 2 * std::mem::size_of::<usize>();
+        }
+    }
+    bytes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactOptions {
+    /// Synthetic local-AS prefix placed ahead of each received payload.
+    /// `None` keeps received paths only.
+    pub export_tail: Option<ExportTail>,
+    pub max_owners: usize,
+    pub max_scratch_bytes: usize,
+    pub max_arena_bytes: usize,
+    pub max_duration: Duration,
+}
+
+impl Default for CompactOptions {
+    fn default() -> Self {
+        Self {
+            export_tail: None,
+            max_owners: 1_000_000,
+            max_scratch_bytes: 256 * 1024 * 1024,
+            max_arena_bytes: 32 * 1024 * 1024,
+            max_duration: Duration::from_secs(2),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportTail {
+    pub asn: u32,
+    pub kind: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactOutcome {
+    Published {
+        entries: usize,
+        shared_slices: usize,
+        before_bytes: usize,
+        after_bytes: usize,
+        arena_bytes: usize,
+        scratch_bytes_estimate: usize,
+        transition_bytes_estimate: usize,
+    },
+    Discarded,
+}
+
+struct Candidate {
+    payload: Vec<u8>,
+    shapes: Vec<(u8, u8)>,
+    bounds: Vec<usize>,
+    encoding: Encoding,
+    canonical_len: usize,
+    hash: u64,
+    summary: AsPathSummary,
+}
+
+impl Candidate {
+    fn from_entry(entry: &PathEntry) -> Option<Self> {
+        let mut payload = Vec::new();
+        let mut shapes = Vec::new();
+        let mut bounds = vec![0];
+        for segment in entry.as_path().segments() {
+            let count = u8::try_from(segment.len()).ok()?;
+            shapes.push((segment.kind(), count));
+            for asn in segment.asns() {
+                push_asn(&mut payload, entry.encoding, asn)?;
+                bounds.push(payload.len());
+            }
+        }
+        Some(Self {
+            payload,
+            shapes,
+            bounds,
+            encoding: entry.encoding,
+            canonical_len: entry.canonical_len,
+            hash: entry.canonical_hash,
+            summary: entry.summary,
+        })
+    }
+
+    fn with_export_tail(&self, tail: ExportTail) -> Option<Self> {
+        let mut payload = Vec::new();
+        push_asn(&mut payload, self.encoding, tail.asn)?;
+        payload.extend_from_slice(&self.payload);
+        let mut shapes = self.shapes.clone();
+        if let Some((kind, count)) = shapes.first_mut()
+            && *kind == tail.kind
+            && *count < 255
+        {
+            *count += 1;
+        } else {
+            shapes.insert(0, (tail.kind, 1));
+        }
+        let mut bounds = vec![0];
+        let mut offset = 0;
+        for &(kind, count) in &shapes {
+            let _ = kind;
+            for _ in 0..count {
+                offset += asn_width(&payload[offset..], self.encoding)?;
+                bounds.push(offset);
+            }
+        }
+        let view = AsPath::stored_shaped(&payload, self.encoding, None, Some(&shapes));
+        let summary = view.summary();
+        let canonical: Vec<u8> = view.canonical_bytes().collect();
+        let hash = content_hash(&canonical);
+        let canonical_len = canonical.len();
+        Some(Self {
+            payload,
+            shapes,
+            bounds,
+            encoding: self.encoding,
+            canonical_len,
+            hash,
+            summary,
+        })
+    }
+
+    fn canonical_bytes(&self) -> Vec<u8> {
+        AsPath::stored_shaped(
+            &self.payload,
+            self.encoding,
+            Some(self.summary),
+            Some(&self.shapes),
+        )
+        .canonical_bytes()
+        .collect()
+    }
+
+    fn entry(&self, arena: Arc<[u8]>, offset: usize) -> Result<PathEntry, StoreError> {
+        Ok(PathEntry {
+            descriptor: PathDescriptor::new(offset, self.payload.len())?,
+            bytes: arena,
+            stored_len: self.payload.len(),
+            shapes: Some(self.shapes.clone().into_boxed_slice()),
+            canonical_len: self.canonical_len,
+            canonical_hash: self.hash,
+            encoding: self.encoding,
+            summary: self.summary,
+        })
+    }
+}
+
+fn push_asn(out: &mut Vec<u8>, encoding: Encoding, asn: u32) -> Option<()> {
+    match encoding {
+        Encoding::Canonical => out.extend_from_slice(&asn.to_be_bytes()),
+        Encoding::Escaped if asn == 0 => return None,
+        Encoding::Escaped if asn <= u32::from(u16::MAX) => {
+            out.extend_from_slice(&(asn as u16).to_be_bytes());
+        }
+        Encoding::Escaped => {
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&asn.to_be_bytes());
+        }
+    }
+    Some(())
+}
+
+fn asn_width(bytes: &[u8], encoding: Encoding) -> Option<usize> {
+    match encoding {
+        Encoding::Canonical => bytes.get(..4).map(|_| 4),
+        Encoding::Escaped => {
+            let unit = u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?);
+            if unit != 0 {
+                Some(2)
+            } else {
+                bytes.get(..6).map(|_| 6)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Arena {
+    buf: Vec<u8>,
+    // Short windows: at most 32 endpoints per ASN start. Long paths
+    // share requested suffixes; total hashing/comparison work is bounded.
+    windows: HashMap<(u64, usize), Vec<usize>>,
+    requested: HashSet<(u64, usize)>,
+    long_lengths: HashSet<usize>,
+    work_remaining: usize,
+}
+
+impl Arena {
+    fn place(&mut self, payload: &[u8], bounds: &[usize], limit: usize) -> Option<(usize, bool)> {
+        if payload.is_empty() {
+            return Some((0, true));
+        }
+        self.work_remaining = self.work_remaining.checked_sub(payload.len())?;
+        let key = (content_hash(payload), payload.len());
+        if let Some(candidates) = self.windows.get(&key) {
+            for &offset in candidates {
+                self.work_remaining = self.work_remaining.checked_sub(payload.len())?;
+                if (payload.len() > LINE || offset % LINE + payload.len() <= LINE)
+                    && self.buf[offset..offset + payload.len()] == *payload
+                {
+                    return Some((offset, true));
+                }
+            }
+        }
+        let offset = aligned_offset(self.buf.len(), payload.len());
+        let end = offset.checked_add(payload.len())?;
+        if end.checked_add(LINE - 1)? > limit {
+            return None;
+        }
+        PathDescriptor::new(offset.checked_add(LINE - 2)?, payload.len()).ok()?;
+        self.buf.resize(offset, 0);
+        self.buf.extend_from_slice(payload);
+        for (index, &start) in bounds.iter().enumerate() {
+            for &end in &bounds[index + 1..] {
+                let len = end - start;
+                if len > LINE {
+                    break;
+                }
+                if (offset + start) % LINE + len > LINE {
+                    continue;
+                }
+                self.work_remaining = self.work_remaining.checked_sub(len)?;
+                let window = &payload[start..end];
+                let key = (content_hash(window), len);
+                if self.requested.contains(&key) {
+                    let slots = self.windows.entry(key).or_default();
+                    if !slots
+                        .iter()
+                        .any(|&prior| self.buf[prior..prior + len] == *window)
+                    {
+                        slots.push(offset + start);
+                    }
+                }
+            }
+        }
+        // Prepend-derived long tails are indexed only at lengths that are
+        // actually requested. Hashing work is explicitly bounded.
+        for &start in bounds {
+            let len = payload.len() - start;
+            if len > LINE && self.long_lengths.contains(&len) {
+                self.work_remaining = self.work_remaining.checked_sub(len)?;
+                self.windows
+                    .entry((content_hash(&payload[start..]), len))
+                    .or_default()
+                    .push(offset + start);
+            }
+        }
+        Some((offset, false))
+    }
+}
+
+fn aligned_offset(cursor: usize, len: usize) -> usize {
+    let cursor = (cursor + 1) & !1;
+    if len > LINE {
+        return cursor;
+    }
+    let line_off = cursor % LINE;
+    if line_off + len <= LINE {
+        cursor
+    } else {
+        cursor + (LINE - line_off)
     }
 }
 
@@ -608,5 +1076,204 @@ mod tests {
         assert!(!copied.is_compact());
         assert_eq!(copied.bytes(), expected_copy.as_slice());
         assert_eq!(copied.fingerprint(), content_hash(&expected_copy));
+    }
+
+    fn owners(paths: &[Vec<u8>]) -> Vec<Arc<Vec<Attribute>>> {
+        paths
+            .iter()
+            .map(|p| {
+                Arc::new(vec![
+                    Attribute::new_with_bin(Attribute::AS_PATH, p.clone()).unwrap(),
+                ])
+            })
+            .collect()
+    }
+
+    fn checkpoint(
+        store: &mut AsPathStore,
+        owners: &mut [Arc<Vec<Attribute>>],
+        options: CompactOptions,
+    ) -> CompactOutcome {
+        store.compact_attributes(&mut owners.iter_mut().collect::<Vec<_>>(), options)
+    }
+
+    #[test]
+    fn checkpoint_is_complete_bounded_and_releases_withdrawn_entries() {
+        let paths: Vec<_> = (1..=128)
+            .map(|i| canonical(&[(2, &[i, 65535, 65536, 9, 8, 7])]))
+            .collect();
+        let mut owners = owners(&paths);
+        let mut store = AsPathStore::new(1); // Accelerator cannot contain all live paths.
+        for owner in &mut owners {
+            store.intern_attributes(owner);
+        }
+        let held = Arc::clone(owners[0][0].packed_as_path().unwrap());
+        let outcome = checkpoint(&mut store, &mut owners, CompactOptions::default());
+        let CompactOutcome::Published {
+            before_bytes,
+            after_bytes,
+            ..
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(after_bytes < before_bytes);
+        assert!(store.records() <= 1);
+        for (owner, expected) in owners.iter().zip(&paths) {
+            let entry = owner[0].packed_as_path().unwrap();
+            assert_eq!(entry.canonical_bytes(), *expected);
+            assert!(entry.shapes.is_some());
+            let address = entry.slice().as_ptr() as usize;
+            assert!(address % LINE + entry.stored_len <= LINE);
+        }
+        assert_eq!(held.canonical_bytes(), paths[0]);
+        assert!(held.shapes.is_none());
+        let weak = Arc::downgrade(owners[0][0].packed_as_path().unwrap());
+        owners.clear();
+        assert!(weak.upgrade().is_none());
+        store.purge_expired();
+        assert_eq!(store.records(), 0);
+    }
+
+    #[test]
+    fn checkpoint_preserves_fanout_and_is_deterministic() {
+        let paths: Vec<_> = (1..=64).map(|i| canonical(&[(2, &[i, 2, 3, 4])])).collect();
+        let mut first = owners(&paths);
+        first.push(Arc::clone(&first[0]));
+        let mut second = owners(&paths);
+        second.reverse();
+        let mut store = AsPathStore::default();
+        assert!(matches!(
+            checkpoint(&mut store, &mut first, CompactOptions::default()),
+            CompactOutcome::Published { .. }
+        ));
+        assert!(Arc::ptr_eq(&first[0], first.last().unwrap()));
+        assert!(matches!(
+            checkpoint(&mut store, &mut second, CompactOptions::default()),
+            CompactOutcome::Published { .. }
+        ));
+        second.reverse();
+        for (a, b) in first.iter().zip(&second) {
+            let a = a[0].packed_as_path().unwrap();
+            let b = b[0].packed_as_path().unwrap();
+            // Prefix padding depends on allocation address; relative placement does not.
+            let relative = |e: &PathEntry| e.slice().as_ptr() as usize % LINE;
+            assert_eq!(relative(a), relative(b));
+            assert_eq!(a.stored_len, b.stored_len);
+        }
+    }
+
+    #[test]
+    fn checkpoint_failure_does_not_change_attributes_or_cache() {
+        let mut owners = owners(&[canonical(&[(2, &[1, 2, 3])])]);
+        let original = Arc::clone(&owners[0]);
+        let mut store = AsPathStore::default();
+        for options in [
+            CompactOptions {
+                max_scratch_bytes: 0,
+                ..Default::default()
+            },
+            CompactOptions {
+                max_arena_bytes: 0,
+                ..Default::default()
+            },
+            CompactOptions {
+                max_owners: 0,
+                ..Default::default()
+            },
+            CompactOptions {
+                max_duration: Duration::ZERO,
+                ..Default::default()
+            },
+            CompactOptions {
+                export_tail: Some(ExportTail { asn: 1, kind: 99 }),
+                ..Default::default()
+            },
+            CompactOptions::default(), // Padding makes this tiny generation larger.
+        ] {
+            assert_eq!(
+                checkpoint(&mut store, &mut owners, options),
+                CompactOutcome::Discarded
+            );
+            assert!(Arc::ptr_eq(&original, &owners[0]));
+            assert_eq!(store.records(), 0);
+        }
+    }
+
+    #[test]
+    fn rollover_confederations_zero_and_shapes_reconstruct_exactly() {
+        let members = vec![1; 255];
+        let full = canonical(&[(2, &members)]);
+        let mut rolled = canonical(&[(2, &[65001])]);
+        rolled.extend_from_slice(&full);
+        let mut paths = vec![
+            full,
+            rolled,
+            canonical(&[(3, &[65002]), (2, &[9, 8, 7])]),
+            canonical(&[(2, &[9, 8, 7])]),
+            canonical(&[(1, &[0, u32::MAX]), (2, &[])]),
+        ];
+        paths.extend((1..=64).map(|i| canonical(&[(2, &[i, 8, 7])])));
+        let mut owners = owners(&paths);
+        let old = owners.clone();
+        let mut store = AsPathStore::default();
+        assert!(matches!(
+            checkpoint(&mut store, &mut owners, CompactOptions::default()),
+            CompactOutcome::Published { .. }
+        ));
+        for ((owner, old), path) in owners.iter().zip(&old).zip(&paths) {
+            assert_eq!(owner[0], old[0]);
+            assert_eq!(owner[0].packed_as_path().unwrap().canonical_bytes(), *path);
+            assert_eq!(owner[0].encode_to_bytes(), old[0].encode_to_bytes());
+        }
+        let full = owners[0][0].packed_as_path().unwrap();
+        let rolled = owners[1][0].packed_as_path().unwrap();
+        assert_eq!(full.descriptor.offset(), rolled.descriptor.offset() + 2);
+        assert_eq!(
+            full.prepended(2, 65001).unwrap().canonical_bytes(),
+            paths[1]
+        );
+    }
+
+    #[test]
+    fn short_slices_of_long_parents_never_cross_lines_and_capacity_is_fallible() {
+        let mut arena = Arena {
+            work_remaining: 1_000_000,
+            ..Default::default()
+        };
+        let payload: Vec<u8> = (1..=50u16).flat_map(u16::to_be_bytes).collect();
+        let bounds: Vec<_> = (0..=50).map(|i| i * 2).collect();
+        arena.place(&payload, &bounds, 4096).unwrap();
+        // This occurrence crosses offset 64 and must get its own placement.
+        let (offset, shared) = arena
+            .place(&payload[60..68], &[0, 2, 4, 6, 8], 4096)
+            .unwrap();
+        assert!(!shared);
+        assert!(offset % LINE + 8 <= LINE);
+        let candidate =
+            Candidate::from_entry(&PathEntry::new(&canonical(&[(2, &[1])])).unwrap()).unwrap();
+        assert!(
+            candidate
+                .entry(Arc::from([0u8; 4]), (MAX_OFFSET_UNITS + 1) * 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn export_tail_defaults_off_and_keeps_received_semantics() {
+        assert!(CompactOptions::default().export_tail.is_none());
+        let path = PathEntry::new(&canonical(&[(2, &[1, 2, 3])])).unwrap();
+        let candidate = Candidate::from_entry(&path).unwrap();
+        let exported = candidate
+            .with_export_tail(ExportTail {
+                asn: 65001,
+                kind: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            exported.canonical_bytes(),
+            canonical(&[(2, &[65001, 1, 2, 3])])
+        );
+        assert_eq!(path.canonical_bytes(), canonical(&[(2, &[1, 2, 3])]));
     }
 }
