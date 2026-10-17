@@ -1636,6 +1636,14 @@ impl Attribute {
         Ok(Attribute { code, flags, data })
     }
 
+    /// Borrow a validated canonical AS path without copying segment payloads.
+    pub fn as_path(&self) -> Result<crate::as_path::AsPath<'_>, crate::as_path::MalformedAsPath> {
+        if self.code != Self::AS_PATH {
+            return Err(crate::as_path::MalformedAsPath);
+        }
+        crate::as_path::AsPath::from_bytes(self.binary().ok_or(crate::as_path::MalformedAsPath)?)
+    }
+
     pub fn as_path_length(&self) -> usize {
         assert_eq!(self.code, Attribute::AS_PATH);
         let buf = self.binary().unwrap();

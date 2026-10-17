@@ -121,56 +121,48 @@ impl SingleAsPathMatch {
     }
 
     fn is_match(&self, attr: &Attribute) -> bool {
-        let mut i = packet::bgp::AsPathIter::new(attr);
+        let Ok(path) = attr.as_path() else {
+            return false;
+        };
+        let mut segments = path.segments();
         match self {
-            SingleAsPathMatch::Include(val) => {
-                for v in i {
-                    for asn in v {
-                        if asn == *val {
-                            return true;
-                        }
-                    }
-                }
-            }
+            SingleAsPathMatch::Include(val) => path.contains_any(&[*val]),
             SingleAsPathMatch::RangeInclude(min, max) => {
-                for v in i {
-                    for asn in v {
-                        if asn >= *min && asn <= *max {
-                            return true;
-                        }
-                    }
-                }
+                segments.any(|segment| segment.asns().any(|asn| (*min..=*max).contains(&asn)))
             }
             SingleAsPathMatch::LeftMost(val) => {
-                if let Some(v) = i.next() {
-                    return !v.is_empty() && v[0] == *val;
-                }
+                segments.next().and_then(|segment| segment.asns().next()) == Some(*val)
             }
-            SingleAsPathMatch::RangeLeftMost(min, max) => {
-                if let Some(v) = i.next() {
-                    return !v.is_empty() && v[0] >= *min && v[0] <= *max;
-                }
-            }
+            SingleAsPathMatch::RangeLeftMost(min, max) => segments
+                .next()
+                .and_then(|segment| segment.asns().next())
+                .is_some_and(|asn| (*min..=*max).contains(&asn)),
+            // These match the serialized endpoint, including sets/confederations;
+            // routing origin summaries intentionally have different semantics.
             SingleAsPathMatch::Origin(val) => {
-                let v: Vec<Vec<u32>> = i.collect();
-                return !v.is_empty() && v[v.len() - 1][v[v.len() - 1].len() - 1] == *val;
+                segments
+                    .last()
+                    .and_then(|segment| segment.asns().next_back())
+                    == Some(*val)
             }
-            SingleAsPathMatch::RangeOrigin(min, max) => {
-                let v: Vec<Vec<u32>> = i.collect();
-                return !v.is_empty()
-                    && v[v.len() - 1][v[v.len() - 1].len() - 1] >= *min
-                    && v[v.len() - 1][v[v.len() - 1].len() - 1] <= *max;
-            }
-            SingleAsPathMatch::Only(val) => {
-                let v: Vec<Vec<u32>> = i.collect();
-                return v.len() == 1 && v[0].len() == 1 && v[0][0] == *val;
-            }
-            SingleAsPathMatch::RangeOnly(min, max) => {
-                let v: Vec<Vec<u32>> = i.collect();
-                return v.len() == 1 && v[0].len() == 1 && v[0][0] >= *min && v[0][0] <= *max;
-            }
+            SingleAsPathMatch::RangeOrigin(min, max) => segments
+                .last()
+                .and_then(|segment| segment.asns().next_back())
+                .is_some_and(|asn| (*min..=*max).contains(&asn)),
+            SingleAsPathMatch::Only(val) => segments.next().is_some_and(|segment| {
+                segment.len() == 1
+                    && segment.asns().next() == Some(*val)
+                    && segments.next().is_none()
+            }),
+            SingleAsPathMatch::RangeOnly(min, max) => segments.next().is_some_and(|segment| {
+                segment.len() == 1
+                    && segment
+                        .asns()
+                        .next()
+                        .is_some_and(|asn| (*min..=*max).contains(&asn))
+                    && segments.next().is_none()
+            }),
         }
-        false
     }
 }
 
@@ -926,9 +918,11 @@ impl Statement {
                 .cloned()
                 .unwrap_or_else(packet::Attribute::empty_as_path);
             let asn = if action.use_left_most {
-                bgp::AsPathIter::new(&existing)
-                    .next()
-                    .and_then(|seg| seg.first().copied())
+                existing
+                    .as_path()
+                    .ok()
+                    .and_then(|path| path.segments().next())
+                    .and_then(|segment| segment.asns().next())
                     .unwrap_or(action.asn)
             } else {
                 action.asn
@@ -5191,5 +5185,97 @@ mod tests {
 
         let dirs: Vec<i32> = ptable.iter_assignments(1).map(|(dir, _)| dir).collect();
         assert_eq!(dirs, vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_as_path_tests {
+    use super::*;
+
+    fn attr(segments: &[(u8, &[u32])]) -> Attribute {
+        let mut bytes = Vec::new();
+        for (kind, asns) in segments {
+            bytes.extend_from_slice(&[*kind, asns.len() as u8]);
+            for asn in *asns {
+                bytes.extend_from_slice(&asn.to_be_bytes());
+            }
+        }
+        Attribute::new_with_bin(Attribute::AS_PATH, bytes).unwrap()
+    }
+
+    #[test]
+    fn all_matchers_preserve_segment_endpoint_semantics() {
+        for kind in 1..=4 {
+            for values in [&[7][..], &[7, 7][..], &[65535, 65536, u32::MAX][..]] {
+                let a = attr(&[(kind, values)]);
+                for target in [7, 8, 65535, 65536, u32::MAX] {
+                    assert_eq!(
+                        SingleAsPathMatch::Include(target).is_match(&a),
+                        values.contains(&target)
+                    );
+                    assert_eq!(
+                        SingleAsPathMatch::LeftMost(target).is_match(&a),
+                        values.first() == Some(&target)
+                    );
+                    assert_eq!(
+                        SingleAsPathMatch::Origin(target).is_match(&a),
+                        values.last() == Some(&target)
+                    );
+                    assert_eq!(
+                        SingleAsPathMatch::Only(target).is_match(&a),
+                        values == [target]
+                    );
+                    let min = target.saturating_sub(1);
+                    let max = target.saturating_add(1);
+                    let range = min..=max;
+                    assert_eq!(
+                        SingleAsPathMatch::RangeInclude(min, max).is_match(&a),
+                        values.iter().any(|asn| range.contains(asn))
+                    );
+                    assert_eq!(
+                        SingleAsPathMatch::RangeLeftMost(min, max).is_match(&a),
+                        values.first().is_some_and(|asn| range.contains(asn))
+                    );
+                    assert_eq!(
+                        SingleAsPathMatch::RangeOrigin(min, max).is_match(&a),
+                        values.last().is_some_and(|asn| range.contains(asn))
+                    );
+                    assert_eq!(
+                        SingleAsPathMatch::RangeOnly(min, max).is_match(&a),
+                        values.len() == 1 && range.contains(&values[0])
+                    );
+                }
+            }
+            let a = attr(&[(2, &[1, 7]), (kind, &[8, 9])]);
+            assert!(SingleAsPathMatch::LeftMost(1).is_match(&a));
+            assert!(SingleAsPathMatch::Origin(9).is_match(&a));
+            assert!(!SingleAsPathMatch::Only(1).is_match(&a));
+            if kind != 2 {
+                assert_eq!(a.as_path().unwrap().summary().origin, None);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_segments_and_malformed_tails_do_not_match_endpoints() {
+        for segments in [
+            vec![],
+            vec![(2, &[][..])],
+            vec![(1, &[][..])],
+            vec![(2, &[7][..]), (2, &[][..])],
+        ] {
+            let a = attr(&segments);
+            assert!(!SingleAsPathMatch::Origin(7).is_match(&a));
+            assert!(!SingleAsPathMatch::Only(7).is_match(&a));
+        }
+        let a = attr(&[(2, &[]), (2, &[7])]);
+        assert!(!SingleAsPathMatch::LeftMost(7).is_match(&a));
+        assert!(SingleAsPathMatch::Origin(7).is_match(&a));
+        assert!(!SingleAsPathMatch::Only(7).is_match(&a));
+        let mut bytes = attr(&[(2, &[7])]).binary().unwrap().clone();
+        bytes.push(2);
+        let a = Attribute::new_with_bin(Attribute::AS_PATH, bytes).unwrap();
+        assert!(!SingleAsPathMatch::Include(7).is_match(&a));
+        assert!(!SingleAsPathMatch::LeftMost(7).is_match(&a));
     }
 }

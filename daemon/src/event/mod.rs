@@ -14124,6 +14124,35 @@ mod as_loop_tests {
         ]);
         assert!(!is_as_loop(&attr, 65001, 0));
     }
+
+    #[test]
+    fn truncated_tail_does_not_become_a_loop_from_an_early_match() {
+        let mut bytes = as_path_attr(&[65001]).binary().unwrap().clone();
+        bytes.extend_from_slice(&[2, 1, 0]);
+        let path = bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, bytes).unwrap();
+        assert!(path.as_path_count(65001).is_err());
+        assert!(!is_as_loop(&Arc::new(vec![path]), 65001, 65000));
+    }
+
+    #[test]
+    fn loop_checks_sets_confederations_and_wide_asns() {
+        for kind in 1..=4 {
+            let mut bytes = vec![kind, 2];
+            bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+            bytes.extend_from_slice(&65000u32.to_be_bytes());
+            let attrs = Arc::new(vec![
+                bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, bytes).unwrap(),
+            ]);
+            assert!(is_as_loop(&attrs, u32::MAX, 0));
+            assert!(is_as_loop(&attrs, 65001, 65000));
+            assert!(!is_as_loop(&attrs, 65001, 0));
+        }
+        assert!(!is_as_loop(
+            &Arc::new(vec![bgp::Attribute::empty_as_path()]),
+            65001,
+            0
+        ));
+    }
 }
 
 #[cfg(test)]
