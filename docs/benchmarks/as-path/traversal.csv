@@ -1,0 +1,16 @@
+operation,median_ns,allocations_per_op,min_ns,max_ns
+short/owned_decode,27.04,1.000,25.28567,27.77987
+short/borrowed_decode,4.15,0.000,4.06396,4.68776
+short/two_counts_miss,10.72,0.000,10.48149,11.1224
+short/borrowed_presence_miss,5.28,0.000,5.10775,6.01442
+short/borrowed_summary,4.32,0.000,4.30558,4.67542
+mixed/owned_decode,92.92,4.000,90.97162,96.6438
+mixed/borrowed_decode,11.49,0.000,11.17277,11.84227
+mixed/two_counts_miss,32.52,0.000,31.83758,34.87006
+mixed/borrowed_presence_miss,14.15,0.000,13.77275,14.72258
+mixed/borrowed_summary,8.46,0.000,8.44488,8.76855
+long/owned_decode,1792.56,28.000,1724.77953,1825.60117
+long/borrowed_decode,216.68,0.000,212.84468,223.38601
+long/two_counts_miss,1631.95,0.000,1611.01406,1660.13506
+long/borrowed_presence_miss,490.61,0.000,482.24474,491.36719
+long/borrowed_summary,9.99,0.000,9.5777,11.32331

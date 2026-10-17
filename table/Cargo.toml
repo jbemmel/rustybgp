@@ -12,3 +12,7 @@ ip_network_table-deps-treebitmap = "0.5"
 patricia_tree = "0.10"
 regex = "1"
 thiserror = "2"
+
+[[bench]]
+name = "as_path"
+harness = false

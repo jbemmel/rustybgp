@@ -10,3 +10,7 @@ bytes = "1"
 fnv = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 thiserror = "2"
+
+[[bench]]
+name = "as_path"
+harness = false

@@ -931,12 +931,16 @@ pub(super) fn is_as_loop(
     let Some(as_path) = attr.iter().find(|a| a.code() == bgp::Attribute::AS_PATH) else {
         return false;
     };
-    if as_path.as_path_count(local_asn).is_ok_and(|n| n > 0) {
-        return true;
-    }
-    confederation_id != 0
-        && confederation_id != local_asn
-        && as_path.as_path_count(confederation_id).is_ok_and(|n| n > 0)
+    // Validate the complete path before accepting a match, just as the fallible
+    // count did; a matching prefix must not hide a truncated trailing segment.
+    let confed_asn = if confederation_id == 0 {
+        local_asn
+    } else {
+        confederation_id
+    };
+    as_path
+        .as_path()
+        .is_ok_and(|path| path.contains_any(&[local_asn, confed_asn]))
 }
 
 /// Inject LOCAL_PREF with the default value (100) when it is absent from `attr`.
