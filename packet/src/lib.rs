@@ -14,6 +14,8 @@
 // limitations under the License.
 
 pub mod as_path;
+#[cfg(feature = "packed-as-paths")]
+pub mod as_path_store;
 pub mod bgp;
 pub use self::bgp::Notification;
 pub use self::bgp::validate_message;

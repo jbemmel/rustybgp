@@ -14,3 +14,12 @@ thiserror = "2"
 [[bench]]
 name = "as_path"
 harness = false
+
+[features]
+default = []
+packed-as-paths = []
+
+[[bench]]
+name = "packed_as_path"
+harness = false
+required-features = ["packed-as-paths"]

@@ -1,0 +1,1 @@
+mode=raw observations=1000000 keys=512 payload_bytes=9863220 attribute_record_bytes=40000000 elapsed_s=0.034456 VmHWM:	   72708 kB VmRSS:	   72708 kB

@@ -5272,7 +5272,7 @@ mod borrowed_as_path_tests {
         assert!(!SingleAsPathMatch::LeftMost(7).is_match(&a));
         assert!(SingleAsPathMatch::Origin(7).is_match(&a));
         assert!(!SingleAsPathMatch::Only(7).is_match(&a));
-        let mut bytes = attr(&[(2, &[7])]).binary().unwrap().clone();
+        let mut bytes = attr(&[(2, &[7])]).binary().unwrap().to_vec();
         bytes.push(2);
         let a = Attribute::new_with_bin(Attribute::AS_PATH, bytes).unwrap();
         assert!(!SingleAsPathMatch::Include(7).is_match(&a));

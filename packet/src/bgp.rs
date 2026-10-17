@@ -18,6 +18,7 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use fnv::{FnvHashMap, FnvHashSet};
 
+use std::borrow::Cow;
 use std::convert::Into;
 use std::io::Cursor;
 use std::marker::PhantomData;
@@ -1214,33 +1215,23 @@ impl Capability {
     }
 }
 
+/// Compatibility iterator for callers explicitly requesting owned segments.
 pub struct AsPathIter<'a> {
-    cur: Cursor<&'a Vec<u8>>,
-    len: u64,
+    segments: Option<crate::as_path::AsPathSegments<'a>>,
 }
 
 impl<'a> AsPathIter<'a> {
-    pub fn new(attr: &'a Attribute) -> AsPathIter<'a> {
-        AsPathIter {
-            cur: Cursor::new(attr.binary().unwrap()),
-            len: attr.binary().unwrap().len() as u64,
+    pub fn new(attr: &'a Attribute) -> Self {
+        Self {
+            segments: attr.as_path().ok().map(|path| path.segments()),
         }
     }
 }
 
-impl<'a> Iterator for AsPathIter<'a> {
+impl Iterator for AsPathIter<'_> {
     type Item = Vec<u32>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cur.position() < self.len {
-            let _ = self.cur.read_u8().ok()?;
-            let n = self.cur.read_u8().ok()?;
-            let mut v = Vec::new();
-            for _ in 0..n {
-                v.push(self.cur.read_u32::<NetworkEndian>().ok()?);
-            }
-            return Some(v);
-        }
-        None
+        Some(self.segments.as_mut()?.next()?.asns().collect())
     }
 }
 
@@ -1248,15 +1239,55 @@ impl<'a> Iterator for AsPathIter<'a> {
 enum AttributeData {
     Val(u32),
     Bin(Vec<u8>),
+    #[cfg(feature = "packed-as-paths")]
+    PackedPath(Arc<crate::as_path_store::PathEntry>),
     /// Raw bytes for an unknown optional attribute (RFC 4271 §5.1.4).
     Opaque(Vec<u8>),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "packed-as-paths"), derive(PartialEq, Eq, Hash))]
 pub struct Attribute {
     code: u8,
     flags: u8,
     data: AttributeData,
+}
+
+#[cfg(feature = "packed-as-paths")]
+impl PartialEq for Attribute {
+    fn eq(&self, other: &Self) -> bool {
+        if self.code != other.code || self.flags != other.flags {
+            return false;
+        }
+        match (&self.data, &other.data) {
+            (AttributeData::PackedPath(a), AttributeData::Bin(b))
+            | (AttributeData::Bin(b), AttributeData::PackedPath(a)) => a.matches(b),
+            _ => self.data == other.data,
+        }
+    }
+}
+#[cfg(feature = "packed-as-paths")]
+impl Eq for Attribute {}
+#[cfg(feature = "packed-as-paths")]
+impl std::hash::Hash for Attribute {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.code.hash(state);
+        self.flags.hash(state);
+        match &self.data {
+            AttributeData::PackedPath(entry) => {
+                1u8.hash(state);
+                entry.fingerprint().hash(state);
+            }
+            AttributeData::Bin(bytes) if self.code == Self::AS_PATH => {
+                1u8.hash(state);
+                crate::as_path_store::content_hash(bytes).hash(state);
+            }
+            data => {
+                0u8.hash(state);
+                data.hash(state);
+            }
+        }
+    }
 }
 
 impl Attribute {
@@ -1359,9 +1390,21 @@ impl Attribute {
             code: Self::AS_PATH,
             data: AttributeData::Bin(Vec::new()),
         }
+        .pack_path()
     }
 
     pub fn new_with_bin(code: u8, bin: Vec<u8>) -> Option<Self> {
+        #[cfg(feature = "packed-as-paths")]
+        if code == Self::AS_PATH {
+            let mut store = crate::as_path_store::AsPathStore::new(0);
+            if let Ok(entry) = store.intern(&bin) {
+                return Some(Self {
+                    flags: Self::canonical_flags(code)?,
+                    code,
+                    data: AttributeData::PackedPath(entry),
+                });
+            }
+        }
         Some(Attribute {
             flags: Self::canonical_flags(code)?,
             code,
@@ -1369,17 +1412,60 @@ impl Attribute {
         })
     }
 
+    #[cfg(feature = "packed-as-paths")]
+    pub fn packed_as_path(&self) -> Option<&Arc<crate::as_path_store::PathEntry>> {
+        if let AttributeData::PackedPath(entry) = &self.data {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Retain canonical storage if validation/capacity prevents interning; packet
+    /// acceptance is unchanged. Called once before an UPDATE's prefix fanout.
+    #[cfg(feature = "packed-as-paths")]
+    pub fn intern_as_path(&mut self, store: &mut crate::as_path_store::AsPathStore) {
+        if self.code != Self::AS_PATH {
+            return;
+        }
+        let entry = match &self.data {
+            AttributeData::Bin(bytes) => store.intern(bytes).ok(),
+            AttributeData::PackedPath(entry) => Some(store.intern_entry(Arc::clone(entry))),
+            _ => None,
+        };
+        if let Some(entry) = entry {
+            self.data = AttributeData::PackedPath(entry);
+        }
+    }
+
+    fn pack_path(self) -> Self {
+        #[cfg(feature = "packed-as-paths")]
+        {
+            let mut result = self;
+            result.intern_as_path(&mut crate::as_path_store::AsPathStore::new(0));
+            result
+        }
+        #[cfg(not(feature = "packed-as-paths"))]
+        self
+    }
+
     pub fn value(&self) -> Option<u32> {
         match self.data {
             AttributeData::Val(v) => Some(v),
             AttributeData::Bin(_) | AttributeData::Opaque(_) => None,
+            #[cfg(feature = "packed-as-paths")]
+            AttributeData::PackedPath(_) => None,
         }
     }
 
-    pub fn binary(&self) -> Option<&Vec<u8>> {
+    /// Canonical bytes: borrowed for ordinary storage, expanded temporarily for
+    /// packed paths. Hot path consumers should use as_path() instead.
+    pub fn binary(&self) -> Option<Cow<'_, [u8]>> {
         match &self.data {
             AttributeData::Val(_) => None,
-            AttributeData::Bin(v) | AttributeData::Opaque(v) => Some(v),
+            AttributeData::Bin(v) | AttributeData::Opaque(v) => Some(Cow::Borrowed(v)),
+            #[cfg(feature = "packed-as-paths")]
+            AttributeData::PackedPath(entry) => Some(Cow::Owned(entry.canonical_bytes())),
         }
     }
 
@@ -1641,22 +1727,31 @@ impl Attribute {
         if self.code != Self::AS_PATH {
             return Err(crate::as_path::MalformedAsPath);
         }
-        crate::as_path::AsPath::from_bytes(self.binary().ok_or(crate::as_path::MalformedAsPath)?)
+        match &self.data {
+            AttributeData::Bin(bytes) => crate::as_path::AsPath::from_bytes(bytes),
+            #[cfg(feature = "packed-as-paths")]
+            AttributeData::PackedPath(entry) => Ok(entry.as_path()),
+            _ => Err(crate::as_path::MalformedAsPath),
+        }
     }
 
     pub fn as_path_length(&self) -> usize {
         assert_eq!(self.code, Attribute::AS_PATH);
+        #[cfg(feature = "packed-as-paths")]
+        if let AttributeData::PackedPath(entry) = &self.data {
+            return entry.as_path().summary().hop_count;
+        }
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
-        let mut c = Cursor::new(buf);
-        let mut aslen = 0;
+        let mut c = Cursor::new(buf.as_ref());
+        let mut aslen = 0usize;
         while c.position() < len {
             let t = c.read_u8().unwrap();
             let l = c.read_u8().unwrap();
 
             match t {
                 Attribute::AS_PATH_TYPE_SET => aslen += 1,
-                Attribute::AS_PATH_TYPE_SEQ => aslen += l,
+                Attribute::AS_PATH_TYPE_SEQ => aslen += usize::from(l),
                 Attribute::AS_PATH_TYPE_CONFED_SEQ => {}
                 Attribute::AS_PATH_TYPE_CONFED_SET => {}
                 _ => unreachable!(),
@@ -1664,15 +1759,24 @@ impl Attribute {
 
             c.set_position(c.position() + l as u64 * 4);
         }
-        aslen as usize
+        aslen
     }
 
     pub fn as_path_count(&self, asn: u32) -> Result<usize, Error> {
+        #[cfg(feature = "packed-as-paths")]
+        if let AttributeData::PackedPath(entry) = &self.data {
+            return Ok(entry
+                .as_path()
+                .segments()
+                .flat_map(|s| s.asns())
+                .filter(|n| *n == asn)
+                .count());
+        }
         let mut num = 0;
 
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
-        let mut c = Cursor::new(buf);
+        let mut c = Cursor::new(buf.as_ref());
 
         while c.position() < len {
             let _type = c.read_u8()?;
@@ -1690,112 +1794,124 @@ impl Attribute {
     }
 
     pub fn as_path_prepend(&self, as_number: u32) -> Attribute {
-        assert_eq!(self.code, Attribute::AS_PATH);
-        let buf = self.binary().unwrap();
-        let len = buf.len() as u64;
-
-        let data = if len != 0 && buf[0] == Attribute::AS_PATH_TYPE_SEQ && buf[1] < 255 {
-            let mut new_buf = Vec::with_capacity(len as usize + 4);
-            new_buf.put_u8(buf[0]);
-            new_buf.put_u8(buf[1] + 1);
-            new_buf.put_u32(as_number);
-            new_buf.put(&buf[2..]);
-            AttributeData::Bin(new_buf)
-        } else if len == 0 {
-            let mut new_buf = Vec::with_capacity(6);
-            new_buf.put_u8(Attribute::AS_PATH_TYPE_SEQ);
-            new_buf.put_u8(1);
-            new_buf.put_u32(as_number);
-            AttributeData::Bin(new_buf)
-        } else {
-            let mut new_buf = Vec::with_capacity(len as usize + 6);
-            new_buf.put_u8(Attribute::AS_PATH_TYPE_SEQ);
-            new_buf.put_u8(1);
-            new_buf.put_u32(as_number);
-            new_buf.put(&buf[..]);
-            AttributeData::Bin(new_buf)
-        };
-        Attribute {
-            code: self.code,
-            flags: self.flags,
-            data,
-        }
+        self.prepend_as_path(Self::AS_PATH_TYPE_SEQ, as_number)
     }
 
-    /// Prepend `as_number` to the AS_CONFED_SEQUENCE segment of this AS_PATH.
-    ///
-    /// Used when advertising to a Confed-eBGP peer (RFC 5065 §5.1): the local
-    /// Member-AS is added to the front of the confederation path so that other
-    /// members can detect loops.
+    /// Prepend a Member-AS in a confederation sequence, retaining all segments.
     pub fn as_path_prepend_confed(&self, as_number: u32) -> Attribute {
-        assert_eq!(self.code, Attribute::AS_PATH);
-        let buf = self.binary().unwrap();
-        let len = buf.len() as u64;
+        self.prepend_as_path(Self::AS_PATH_TYPE_CONFED_SEQ, as_number)
+    }
 
-        let data = if len != 0 && buf[0] == Attribute::AS_PATH_TYPE_CONFED_SEQ && buf[1] < 255 {
-            let mut new_buf = Vec::with_capacity(len as usize + 4);
-            new_buf.put_u8(buf[0]);
-            new_buf.put_u8(buf[1] + 1);
-            new_buf.put_u32(as_number);
-            new_buf.put(&buf[2..]);
-            AttributeData::Bin(new_buf)
-        } else if len == 0 {
-            let mut new_buf = Vec::with_capacity(6);
-            new_buf.put_u8(Attribute::AS_PATH_TYPE_CONFED_SEQ);
-            new_buf.put_u8(1);
-            new_buf.put_u32(as_number);
-            AttributeData::Bin(new_buf)
-        } else {
-            let mut new_buf = Vec::with_capacity(len as usize + 6);
-            new_buf.put_u8(Attribute::AS_PATH_TYPE_CONFED_SEQ);
-            new_buf.put_u8(1);
-            new_buf.put_u32(as_number);
-            new_buf.put(&buf[..]);
-            AttributeData::Bin(new_buf)
-        };
-        Attribute {
-            code: self.code,
-            flags: self.flags,
-            data,
+    fn path_byte_length(&self) -> usize {
+        match &self.data {
+            AttributeData::Bin(bytes) => bytes.len(),
+            #[cfg(feature = "packed-as-paths")]
+            AttributeData::PackedPath(entry) => entry.canonical_len(),
+            _ => unreachable!(),
         }
     }
 
-    /// Remove all AS_CONFED_SEQUENCE and AS_CONFED_SET segments from this AS_PATH.
-    ///
-    /// Used when advertising to an external eBGP peer (RFC 5065 §5.1): confed
-    /// segments are internal and must not leak outside the confederation.
-    pub fn as_path_strip_confed(&self) -> Attribute {
-        assert_eq!(self.code, Attribute::AS_PATH);
-        let buf = self.binary().unwrap();
-        let len = buf.len() as u64;
-        let mut c = Cursor::new(buf);
-        let mut new_buf: Vec<u8> = Vec::with_capacity(len as usize);
-
-        while c.position() < len {
-            let seg_type = c.read_u8().unwrap();
-            let seg_len = c.read_u8().unwrap();
-            let seg_bytes = seg_len as usize * 4;
-            let start = c.position() as usize;
-            c.set_position(c.position() + seg_bytes as u64);
-            if seg_type != Attribute::AS_PATH_TYPE_CONFED_SEQ
-                && seg_type != Attribute::AS_PATH_TYPE_CONFED_SET
-            {
-                new_buf.put_u8(seg_type);
-                new_buf.put_u8(seg_len);
-                new_buf.put(&buf[start..start + seg_bytes]);
+    fn prepend_as_path(&self, kind: u8, asn: u32) -> Self {
+        assert_eq!(self.code, Self::AS_PATH);
+        #[cfg(feature = "packed-as-paths")]
+        if let AttributeData::PackedPath(entry) = &self.data
+            && let Ok(next) = entry.prepended(kind, asn)
+        {
+            return Self {
+                code: self.code,
+                flags: self.flags,
+                data: AttributeData::PackedPath(Arc::new(next)),
+            };
+        }
+        // Preserve the canonical backend's bulk-copy prepend.
+        if let AttributeData::Bin(bytes) = &self.data {
+            let merge = !bytes.is_empty() && bytes[0] == kind && bytes[1] < 255;
+            let mut out = Vec::with_capacity(bytes.len() + if merge { 4 } else { 6 });
+            out.extend_from_slice(&[kind, if merge { bytes[1] + 1 } else { 1 }]);
+            out.extend_from_slice(&asn.to_be_bytes());
+            out.extend_from_slice(if merge { &bytes[2..] } else { bytes });
+            return Self {
+                code: self.code,
+                flags: self.flags,
+                data: AttributeData::Bin(out),
+            }
+            .pack_path();
+        }
+        let path = self.as_path().unwrap();
+        let mut segments = path.segments();
+        let mut out = Vec::with_capacity(self.path_byte_length() + 6);
+        let first = segments.next();
+        if let Some(segment) = first.filter(|segment| segment.kind() == kind && segment.len() < 255)
+        {
+            out.extend_from_slice(&[kind, segment.len() as u8 + 1]);
+            out.extend_from_slice(&asn.to_be_bytes());
+            for old in segment.asns() {
+                out.extend_from_slice(&old.to_be_bytes());
+            }
+        } else {
+            out.extend_from_slice(&[kind, 1]);
+            out.extend_from_slice(&asn.to_be_bytes());
+            if let Some(segment) = first {
+                out.extend_from_slice(&[segment.kind(), segment.len() as u8]);
+                for old in segment.asns() {
+                    out.extend_from_slice(&old.to_be_bytes());
+                }
             }
         }
-        Attribute {
+        for segment in segments {
+            out.extend_from_slice(&[segment.kind(), segment.len() as u8]);
+            for old in segment.asns() {
+                out.extend_from_slice(&old.to_be_bytes());
+            }
+        }
+        Self {
             code: self.code,
             flags: self.flags,
-            data: AttributeData::Bin(new_buf),
+            data: AttributeData::Bin(out),
         }
+        .pack_path()
+    }
+
+    /// Remove confederation segments for external export, without decoding an
+    /// intermediate copy of a packed input. Unchanged packed inputs share bytes.
+    pub fn as_path_strip_confed(&self) -> Attribute {
+        let path = self.as_path().unwrap();
+        if !path.segments().any(|s| {
+            matches!(
+                s.kind(),
+                Self::AS_PATH_TYPE_CONFED_SEQ | Self::AS_PATH_TYPE_CONFED_SET
+            )
+        }) {
+            return self.clone();
+        }
+        let mut out = Vec::with_capacity(self.path_byte_length());
+        for segment in path.segments().filter(|s| {
+            !matches!(
+                s.kind(),
+                Self::AS_PATH_TYPE_CONFED_SEQ | Self::AS_PATH_TYPE_CONFED_SET
+            )
+        }) {
+            out.extend_from_slice(&[segment.kind(), segment.len() as u8]);
+            for asn in segment.asns() {
+                out.extend_from_slice(&asn.to_be_bytes());
+            }
+        }
+        Self {
+            code: self.code,
+            flags: self.flags,
+            data: AttributeData::Bin(out),
+        }
+        .pack_path()
     }
 
     pub fn as_path_origin(&self) -> Option<u32> {
+        #[cfg(feature = "packed-as-paths")]
+        if let AttributeData::PackedPath(entry) = &self.data {
+            return entry.as_path().summary().origin;
+        }
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
-        let mut c = Cursor::new(buf);
+        let mut c = Cursor::new(buf.as_ref());
 
         if len < 2 {
             return None;
@@ -1824,47 +1940,27 @@ impl Attribute {
     /// exceeds the two-octet range. RFC 6793 §4.2.2: only in that case does an
     /// OLD BGP speaker also need an accompanying AS4_PATH attribute.
     fn as_path_has_wide_as(&self) -> bool {
-        assert_eq!(self.code, Attribute::AS_PATH);
-        let buf = self.binary().unwrap();
-        let mut pos = 0usize;
-        while pos < buf.len() {
-            let seg_count = buf[pos + 1] as usize;
-            for i in 0..seg_count {
-                let start = pos + 2 + i * 4;
-                let asn = u32::from_be_bytes(buf[start..start + 4].try_into().unwrap());
-                if asn > u16::MAX as u32 {
-                    return true;
-                }
-            }
-            pos += 2 + seg_count * 4;
-        }
-        false
+        self.as_path()
+            .unwrap()
+            .segments()
+            .any(|segment| segment.asns().any(|asn| asn > u16::MAX as u32))
     }
 
     /// Down-converts this (canonical four-octet) AS_PATH to the two-octet wire
     /// form sent to an OLD BGP speaker (RFC 6793 §4.2.2), substituting
     /// AS_TRANS (23456) for any AS number that doesn't fit in two octets.
     fn as_path_downgrade_2byte(&self) -> Vec<u8> {
-        assert_eq!(self.code, Attribute::AS_PATH);
-        let buf = self.binary().unwrap();
-        let mut out = Vec::with_capacity(buf.len());
-        let mut pos = 0usize;
-        while pos < buf.len() {
-            let seg_type = buf[pos];
-            let seg_count = buf[pos + 1] as usize;
-            out.push(seg_type);
-            out.push(buf[pos + 1]);
-            for i in 0..seg_count {
-                let start = pos + 2 + i * 4;
-                let asn = u32::from_be_bytes(buf[start..start + 4].try_into().unwrap());
-                let as2 = if asn > u16::MAX as u32 {
+        let mut out = Vec::new();
+        for segment in self.as_path().unwrap().segments() {
+            out.extend_from_slice(&[segment.kind(), segment.len() as u8]);
+            for asn in segment.asns() {
+                let short = if asn > u16::MAX as u32 {
                     Capability::TRANS_ASN
                 } else {
                     asn as u16
                 };
-                out.extend_from_slice(&as2.to_be_bytes());
+                out.extend_from_slice(&short.to_be_bytes());
             }
-            pos += 2 + seg_count * 4;
         }
         out
     }
@@ -1971,7 +2067,13 @@ impl Attribute {
 
     /// Encode this attribute into its BGP wire format.
     pub fn encode_to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        #[cfg(feature = "packed-as-paths")]
+        let capacity = self
+            .packed_as_path()
+            .map_or(0, |entry| entry.canonical_len() + 4);
+        #[cfg(not(feature = "packed-as-paths"))]
+        let capacity = 0;
+        let mut buf = Vec::with_capacity(capacity);
         let _ = self.encode(&mut buf);
         buf
     }
@@ -1991,6 +2093,35 @@ impl Attribute {
                 dst.put_u8(4);
                 dst.put_u32(self.value().unwrap());
             }
+            #[cfg(feature = "packed-as-paths")]
+            _ if matches!(self.data, AttributeData::PackedPath(_)) => {
+                let AttributeData::PackedPath(entry) = &self.data else {
+                    unreachable!()
+                };
+                let flags = if entry.canonical_len() > 255 {
+                    self.flags | Self::FLAG_EXTENDED
+                } else {
+                    self.flags
+                };
+                dst.put_u8(flags);
+                dst.put_u8(self.code);
+                if flags & Self::FLAG_EXTENDED != 0 {
+                    dst.put_u16(entry.canonical_len() as u16);
+                } else {
+                    dst.put_u8(entry.canonical_len() as u8);
+                }
+                if entry.is_compact() {
+                    for segment in entry.as_path().segments() {
+                        dst.put_u8(segment.kind());
+                        dst.put_u8(segment.len() as u8);
+                        for asn in segment.asns() {
+                            dst.put_u32(asn);
+                        }
+                    }
+                } else {
+                    dst.put_slice(entry.bytes());
+                }
+            }
             _ => {
                 let bin = self.binary().unwrap();
                 let flags = if bin.len() > 255 {
@@ -2005,7 +2136,7 @@ impl Attribute {
                 } else {
                     dst.put_u8(bin.len() as u8);
                 }
-                dst.put_slice(bin);
+                dst.put_slice(&bin);
             }
         }
 
@@ -2336,6 +2467,8 @@ pub struct PeerCodec {
     /// AS_PATH/AGGREGATOR are exchanged in two-octet-ASN wire form with
     /// AS4_PATH/AS4_AGGREGATOR carrying the real four-octet AS numbers.
     pub two_byte_as: bool,
+    #[cfg(feature = "packed-as-paths")]
+    path_store: crate::as_path_store::AsPathStore,
 }
 
 impl Default for PeerCodec {
@@ -2351,6 +2484,8 @@ impl PeerCodec {
             extended_nexthop: false,
             families: FnvHashMap::default(),
             two_byte_as: false,
+            #[cfg(feature = "packed-as-paths")]
+            path_store: Default::default(),
         }
     }
 
@@ -2429,6 +2564,8 @@ impl PeerCodec {
             // RFC 6793 SS4.1: both sides must advertise and receive the
             // capability for the session to use four-octet AS numbers.
             two_byte_as: !(has_as4(local) && has_as4(remote)),
+            #[cfg(feature = "packed-as-paths")]
+            path_store: Default::default(),
         }
     }
 
@@ -2664,7 +2801,7 @@ impl PeerCodec {
                                 let stripped = a.as_path_strip_confed();
                                 let as4_path = Attribute::new_with_bin(
                                     Attribute::AS4_PATH,
-                                    stripped.binary().unwrap().clone(),
+                                    stripped.binary().unwrap().to_vec(),
                                 )
                                 .unwrap();
                                 attr_len += as4_path.encode_wire(dst);
@@ -2681,7 +2818,7 @@ impl PeerCodec {
                             if a.aggregator_asn() > u16::MAX as u32 {
                                 let as4_aggregator = Attribute::new_with_bin(
                                     Attribute::AS4_AGGREGATOR,
-                                    a.binary().unwrap().clone(),
+                                    a.binary().unwrap().to_vec(),
                                 )
                                 .unwrap();
                                 attr_len += as4_aggregator.encode_wire(dst);
@@ -2861,7 +2998,7 @@ impl PeerCodec {
             && let Some(idx) = attrs.iter().position(|a| a.code() == Attribute::AGGREGATOR)
         {
             if attrs[idx].aggregator_asn() == Capability::TRANS_ASN as u32 {
-                let bin = as4_aggregator.binary().unwrap().clone();
+                let bin = as4_aggregator.binary().unwrap().to_vec();
                 attrs[idx] = Attribute::new_with_bin(Attribute::AGGREGATOR, bin).unwrap();
             } else {
                 ignore_as4_path = true;
@@ -2873,8 +3010,8 @@ impl PeerCodec {
             && let Some(idx) = attrs.iter().position(|a| a.code() == Attribute::AS_PATH)
         {
             let merged = Attribute::as_path_reconcile(
-                attrs[idx].binary().unwrap(),
-                as4_path.binary().unwrap(),
+                attrs[idx].binary().unwrap().as_ref(),
+                as4_path.binary().unwrap().as_ref(),
             );
             attrs[idx] = Attribute::new_with_bin(Attribute::AS_PATH, merged).unwrap();
         }
@@ -3057,9 +3194,9 @@ impl PeerCodec {
                                         } else if code == Attribute::MP_UNREACH {
                                             mp_unreach_attr = Some(a);
                                         } else if code == Attribute::NEXTHOP {
-                                            reach_nexthop = a
-                                                .binary()
-                                                .and_then(|b| Nexthop::from_bytes(Family::IPV4, b));
+                                            reach_nexthop = a.binary().and_then(|b| {
+                                                Nexthop::from_bytes(Family::IPV4, &b)
+                                            });
                                         } else if (code == Attribute::AS4_PATH
                                             || code == Attribute::AS4_AGGREGATOR)
                                             && !self.two_byte_as
@@ -3181,7 +3318,7 @@ impl PeerCodec {
                     if buf.len() < 5 {
                         return Err(err);
                     }
-                    let mut c = Cursor::new(buf);
+                    let mut c = Cursor::new(buf.as_ref());
                     let afi = c.read_u16::<NetworkEndian>().unwrap();
                     let safi = c.read_u8().unwrap();
                     let family = Family((afi as u32) << 16 | safi as u32);
@@ -3225,7 +3362,7 @@ impl PeerCodec {
                     if buf.len() < 3 {
                         return Err(err);
                     }
-                    let mut c = Cursor::new(buf);
+                    let mut c = Cursor::new(buf.as_ref());
                     let afi = c.read_u16::<NetworkEndian>().unwrap();
                     let safi = c.read_u8().unwrap();
                     let family = Family((afi as u32) << 16 | safi as u32);
@@ -3255,6 +3392,10 @@ impl PeerCodec {
 
                 if self.two_byte_as {
                     Self::reconcile_as4(&mut attr);
+                }
+                #[cfg(feature = "packed-as-paths")]
+                for attribute in &mut attr {
+                    attribute.intern_as_path(&mut self.path_store);
                 }
 
                 Ok(ParsedMessage::Update(ParsedUpdate::Routes {
@@ -3396,7 +3537,7 @@ mod confed_as_path_tests {
         let result = Attribute::empty_as_path().as_path_prepend_confed(65001);
         let buf = result.binary().unwrap();
         assert_eq!(
-            buf,
+            buf.as_ref(),
             &seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001])
         );
     }
@@ -3407,7 +3548,7 @@ mod confed_as_path_tests {
         let result = input.as_path_prepend_confed(65001);
         let buf = result.binary().unwrap();
         assert_eq!(
-            buf,
+            buf.as_ref(),
             &seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001, 65002])
         );
     }
@@ -3420,7 +3561,7 @@ mod confed_as_path_tests {
         let buf = result.binary().unwrap();
         let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
         expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &full));
-        assert_eq!(buf, &expected);
+        assert_eq!(buf.as_ref(), &expected);
     }
 
     #[test]
@@ -3430,7 +3571,7 @@ mod confed_as_path_tests {
         let buf = result.binary().unwrap();
         let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
         expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100]));
-        assert_eq!(buf, &expected);
+        assert_eq!(buf.as_ref(), &expected);
     }
 
     #[test]
@@ -3443,7 +3584,7 @@ mod confed_as_path_tests {
         let buf = result.binary().unwrap();
         let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100]);
         expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65200]));
-        assert_eq!(buf, &expected);
+        assert_eq!(buf.as_ref(), &expected);
     }
 
     #[test]
@@ -3752,7 +3893,7 @@ mod attribute_tests {
         let bytes = vec![0xDE, 0xAD];
         let a = Attribute::new_with_bin(Attribute::COMMUNITY, bytes.clone()).unwrap();
         assert_eq!(a.code(), Attribute::COMMUNITY);
-        assert_eq!(a.binary(), Some(&bytes));
+        assert_eq!(a.binary().as_deref(), Some(bytes.as_slice()));
     }
 
     #[test]
@@ -3806,7 +3947,7 @@ mod attribute_tests {
                     .iter()
                     .find(|a| a.code() == Attribute::AS_PATH)
                     .expect("AS_PATH must be present");
-                assert_eq!(ap.binary(), Some(&aspath));
+                assert_eq!(ap.binary().as_deref(), Some(aspath.as_slice()));
             }
             _ => panic!("expected Update"),
         }
@@ -3826,7 +3967,7 @@ mod attribute_tests {
                     .iter()
                     .find(|a| a.code() == Attribute::LARGE_COMMUNITY)
                     .expect("LARGE_COMMUNITY must be present");
-                assert_eq!(lc_attr.binary(), Some(&lc));
+                assert_eq!(lc_attr.binary().as_deref(), Some(lc.as_slice()));
             }
             _ => panic!("expected Update"),
         }
@@ -3843,7 +3984,7 @@ mod attribute_tests {
                     .iter()
                     .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
                     .expect("EXTENDED_COMMUNITY must be present");
-                assert_eq!(ec_attr.binary(), Some(&ec));
+                assert_eq!(ec_attr.binary().as_deref(), Some(ec.as_slice()));
             }
             _ => panic!("expected Update"),
         }
@@ -5745,8 +5886,8 @@ mod update_tests {
                     .iter()
                     .find(|a| a.code() == Attribute::PREFIX_SID)
                     .expect("PREFIX_SID must be present");
-                assert_eq!(a.binary().unwrap(), &sid_bytes);
-                let decoded = prefix_sid::PrefixSid::decode(a.binary().unwrap()).unwrap();
+                assert_eq!(a.binary().unwrap().as_ref(), &sid_bytes);
+                let decoded = prefix_sid::PrefixSid::decode(&a.binary().unwrap()).unwrap();
                 assert_eq!(decoded, sid);
             }
             _ => panic!("expected Update"),
@@ -5789,7 +5930,7 @@ mod update_tests {
                     .iter()
                     .find(|a| a.code() == Attribute::PREFIX_SID)
                     .expect("PREFIX_SID must be present");
-                assert_eq!(a.binary().unwrap(), &sid_bytes);
+                assert_eq!(a.binary().unwrap().as_ref(), &sid_bytes);
             }
             _ => panic!("expected Update"),
         }
@@ -5961,7 +6102,7 @@ mod update_tests {
                     .iter()
                     .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
                     .expect("EXTENDED_COMMUNITY missing");
-                assert_eq!(ec.binary().unwrap(), ec_bytes.as_slice());
+                assert_eq!(ec.binary().unwrap().as_ref(), ec_bytes.as_slice());
             }
             _ => panic!("expected Update"),
         }
@@ -7156,7 +7297,7 @@ mod update_tests {
         );
         let opaque = opaque.unwrap();
         assert!(opaque.is_opaque());
-        assert_eq!(opaque.binary().unwrap(), &vec![0x01, 0x02, 0x03]);
+        assert_eq!(opaque.binary().unwrap().as_ref(), &vec![0x01, 0x02, 0x03]);
     }
 
     #[test]
@@ -7358,7 +7499,7 @@ mod two_byte_as_tests {
             Attribute::AS_PATH_TYPE_SEQ,
             &[400000, 300000, 40001],
         ));
-        assert_eq!(as_path.binary().unwrap(), &expected);
+        assert_eq!(as_path.binary().unwrap().as_ref(), &expected);
     }
 
     #[test]
@@ -7372,7 +7513,7 @@ mod two_byte_as_tests {
             .find(|a| a.code() == Attribute::AS_PATH)
             .unwrap();
         assert_eq!(
-            as_path.binary().unwrap(),
+            as_path.binary().unwrap().as_ref(),
             &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 400000])
         );
     }
@@ -7394,7 +7535,7 @@ mod two_byte_as_tests {
             .unwrap();
         // AS_TRANS (23456) is left unresolved: AS4_PATH was ignored (RFC 6793 §4.2.3).
         assert_eq!(
-            as_path.binary().unwrap(),
+            as_path.binary().unwrap().as_ref(),
             &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 23456])
         );
     }
@@ -7415,7 +7556,7 @@ mod two_byte_as_tests {
             .unwrap();
         let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_SET, &[65010, 65020]);
         expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[500000]));
-        assert_eq!(as_path.binary().unwrap(), &expected);
+        assert_eq!(as_path.binary().unwrap().as_ref(), &expected);
     }
 
     #[test]
@@ -7435,7 +7576,7 @@ mod two_byte_as_tests {
         let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
         expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000]));
         expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[600000]));
-        assert_eq!(as_path.binary().unwrap(), &expected);
+        assert_eq!(as_path.binary().unwrap().as_ref(), &expected);
     }
 
     #[test]
@@ -7459,7 +7600,7 @@ mod two_byte_as_tests {
             .find(|a| a.code() == Attribute::AGGREGATOR)
             .unwrap();
         assert_eq!(
-            agg.binary().unwrap(),
+            agg.binary().unwrap().as_ref(),
             &aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1))
         );
     }
@@ -7487,7 +7628,7 @@ mod two_byte_as_tests {
             .find(|a| a.code() == Attribute::AGGREGATOR)
             .unwrap();
         assert_eq!(
-            agg.binary().unwrap(),
+            agg.binary().unwrap().as_ref(),
             &aggregator_bin(65055, Ipv4Addr::new(198, 51, 100, 1))
         );
         // RFC 6793 §4.2.3: AS_PATH reconciliation is skipped too in this case.
@@ -7496,7 +7637,7 @@ mod two_byte_as_tests {
             .find(|a| a.code() == Attribute::AS_PATH)
             .unwrap();
         assert_eq!(
-            as_path.binary().unwrap(),
+            as_path.binary().unwrap().as_ref(),
             &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 23456])
         );
     }
@@ -7526,7 +7667,7 @@ mod two_byte_as_tests {
                     .find(|a| a.code() == Attribute::AS_PATH)
                     .unwrap();
                 assert_eq!(
-                    as_path.binary().unwrap(),
+                    as_path.binary().unwrap().as_ref(),
                     &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 23456])
                 );
             }
@@ -7572,7 +7713,7 @@ mod two_byte_as_tests {
                     .find(|a| a.code() == Attribute::AS_PATH)
                     .unwrap();
                 assert_eq!(
-                    as_path.binary().unwrap(),
+                    as_path.binary().unwrap().as_ref(),
                     &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000])
                 );
             }
@@ -7741,7 +7882,7 @@ mod two_byte_as_tests {
                     .find(|a| a.code() == Attribute::AS_PATH)
                     .unwrap();
                 assert_eq!(
-                    as_path.binary().unwrap(),
+                    as_path.binary().unwrap().as_ref(),
                     &seg_bytes(
                         Attribute::AS_PATH_TYPE_SEQ,
                         &[65000, 4000, 400000, 300000, 40001]
@@ -7781,11 +7922,115 @@ mod two_byte_as_tests {
                     .find(|a| a.code() == Attribute::AGGREGATOR)
                     .unwrap();
                 assert_eq!(
-                    agg.binary().unwrap(),
+                    agg.binary().unwrap().as_ref(),
                     &aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1))
                 );
             }
             _ => panic!("expected Update::Routes"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "packed-as-paths"))]
+mod packed_path_tests {
+    use super::*;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    #[test]
+    fn canonical_equality_hash_flags_and_wire_output_cross_storage_boundaries() {
+        let bytes = vec![2, 3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0];
+        let raw = Attribute {
+            code: Attribute::AS_PATH,
+            flags: Attribute::FLAG_TRANSITIVE,
+            data: AttributeData::Bin(bytes.clone()),
+        };
+        let packed = Attribute::new_with_bin(Attribute::AS_PATH, bytes).unwrap();
+        assert!(packed.packed_as_path().unwrap().is_compact());
+        assert_eq!(raw, packed);
+        for attr in [&raw, &packed] {
+            let mut hasher = DefaultHasher::new();
+            attr.hash(&mut hasher);
+            let mut control = DefaultHasher::new();
+            raw.hash(&mut control);
+            assert_eq!(hasher.finish(), control.finish());
+            assert_eq!(attr.encode_to_bytes(), raw.encode_to_bytes());
+        }
+        let mut flagged = packed.clone();
+        flagged.flags |= Attribute::FLAG_PARTIAL;
+        assert_ne!(flagged, packed);
+        assert_eq!(
+            flagged.encode_to_bytes()[0],
+            raw.flags | Attribute::FLAG_PARTIAL
+        );
+    }
+
+    #[test]
+    fn receive_store_reuses_reconciled_paths_before_prefix_fanout() {
+        let caps = [
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::FourOctetAsNumber(65001),
+        ];
+        let mut codec = PeerCodec::negotiate(&caps, &caps);
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::empty_as_path()
+                .as_path_prepend(65001)
+                .as_path_prepend(65536),
+        ]);
+        let message = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![
+                PathNlri::new("192.0.2.0/24".parse().unwrap()),
+                PathNlri::new("198.51.100.0/24".parse().unwrap()),
+            ],
+            nexthop: Some(Nexthop::V4("203.0.113.1".parse().unwrap())),
+            attr,
+        });
+        let mut wire = Vec::new();
+        codec.encode_to(&message, &mut wire).unwrap();
+        let receive = |codec: &mut PeerCodec| {
+            let mut messages = validate_message(codec.parse_message(&wire).unwrap(), true).unwrap();
+            let Message::Update(Update::Reach { attr, entries, .. }) = messages.next().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(entries.len(), 2);
+            attr.iter()
+                .find(|a| a.code() == Attribute::AS_PATH)
+                .unwrap()
+                .packed_as_path()
+                .unwrap()
+                .clone()
+        };
+        let first = receive(&mut codec);
+        let second = receive(&mut codec);
+        assert!(Arc::ptr_eq(&first, &second));
+        // An independent connection has distinct handles, but equal content.
+        let other = receive(&mut PeerCodec::negotiate(&caps, &caps));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(first, other);
+        let mut old = PeerCodec::negotiate(&caps, &caps);
+        old.two_byte_as = true;
+        wire.clear();
+        old.encode_to(&message, &mut wire).unwrap();
+        let parsed = old.parse_message(&wire).unwrap();
+        let Message::Update(Update::Reach { attr, .. }) =
+            validate_message(parsed, true).unwrap().next().unwrap()
+        else {
+            panic!()
+        };
+        let path = attr
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        assert_eq!(
+            path.as_path()
+                .unwrap()
+                .segments()
+                .flat_map(|s| s.asns())
+                .collect::<Vec<_>>(),
+            [65536, 65001]
+        );
+        assert_eq!(path.as_path_origin(), Some(65001));
     }
 }

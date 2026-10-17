@@ -1,0 +1,1 @@
+shards=1 workers=4 operations=80000 seconds=0.056049 ops_per_second=1427316 p50_ns=514 p95_ns=16776 p99_ns=33160 live_destinations=994

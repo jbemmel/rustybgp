@@ -1,0 +1,1 @@
+mode=packed observations=2135078 keys=2135078 entries=2135078 compact_entries=1855618 payload_bytes=34075394 attribute_record_bytes=85403120 entry_control_bytes=153725616 interner_records=16384 interner_capacity=17252 build_s=1.106628 verification_s=0.167775 VmHWM:	  452536 kB VmRSS:	  452536 kB

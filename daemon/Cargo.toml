@@ -43,3 +43,7 @@ tikv-jemallocator = "0.7"
 
 [dev-dependencies]
 toml = "1.0"
+
+[features]
+default = []
+packed-as-paths = ["rustybgp-packet/packed-as-paths", "rustybgp-table/packed-as-paths"]

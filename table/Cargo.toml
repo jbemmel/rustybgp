@@ -16,3 +16,11 @@ thiserror = "2"
 [[bench]]
 name = "as_path"
 harness = false
+
+[features]
+default = []
+packed-as-paths = ["rustybgp-packet/packed-as-paths"]
+
+[[bench]]
+name = "path_store_replay"
+harness = false

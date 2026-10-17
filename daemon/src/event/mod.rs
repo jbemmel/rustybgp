@@ -2114,7 +2114,10 @@ fn vrf_export_path(
             .iter_mut()
             .find(|a| a.code() == packet::bgp::Attribute::EXTENDED_COMMUNITY)
         {
-            let mut data = ec.binary().cloned().unwrap_or_default();
+            let mut data = ec
+                .binary()
+                .map(|bytes| bytes.into_owned())
+                .unwrap_or_default();
             data.extend_from_slice(&rt_bytes);
             *ec = packet::Attribute::new_with_bin(packet::bgp::Attribute::EXTENDED_COMMUNITY, data)
                 .unwrap();
@@ -9983,14 +9986,14 @@ local-address = "{local}"
             assert_eq!(paths[0].net.encode_to_bytes(), expected_nlri);
             let attrs = &paths[0].new_best().unwrap().attr;
             assert!(attrs.iter().any(|a| a.code() == bgp::Attribute::COMMUNITY
-                && a.binary().unwrap() == &[0xfd, 0xe8, 0x03, 0x85]));
+                && a.binary().unwrap().as_ref() == [0xfd, 0xe8, 0x03, 0x85]));
             if family.safi() == 133 {
                 assert!(paths[0].new_best().unwrap().nexthop.is_none());
                 assert!(
                     attrs
                         .iter()
                         .any(|a| a.code() == bgp::Attribute::EXTENDED_COMMUNITY
-                            && a.binary().unwrap() == &[0x80, 6, 0, 0, 0, 0, 0, 0])
+                            && a.binary().unwrap().as_ref() == [0x80, 6, 0, 0, 0, 0, 0, 0])
                 );
             } else {
                 let expected = if family == Family::IPV4 {
@@ -10347,7 +10350,8 @@ local-address = "{local}"
                 .find(|a| a.code() == 8)
                 .unwrap()
                 .binary()
-                .unwrap(),
+                .unwrap()
+                .as_ref(),
             &communities
         );
     }
@@ -14127,7 +14131,7 @@ mod as_loop_tests {
 
     #[test]
     fn truncated_tail_does_not_become_a_loop_from_an_early_match() {
-        let mut bytes = as_path_attr(&[65001]).binary().unwrap().clone();
+        let mut bytes = as_path_attr(&[65001]).binary().unwrap().to_vec();
         bytes.extend_from_slice(&[2, 1, 0]);
         let path = bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, bytes).unwrap();
         assert!(path.as_path_count(65001).is_err());

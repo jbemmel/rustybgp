@@ -1192,20 +1192,15 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
             })),
         },
         Attribute::AS_PATH => {
-            let mut c = Cursor::new(a.binary().unwrap());
-            let mut segments = Vec::new();
-            while c.position() < c.get_ref().len() as u64 {
-                let code = c.read_u8().unwrap();
-                let n = c.read_u8().unwrap();
-                let mut nums = Vec::new();
-                for _ in 0..n {
-                    nums.push(c.read_u32::<NetworkEndian>().unwrap());
-                }
-                segments.push(api::AsSegment {
-                    r#type: code as i32,
-                    numbers: nums,
-                });
-            }
+            let segments = a
+                .as_path()
+                .unwrap()
+                .segments()
+                .map(|segment| api::AsSegment {
+                    r#type: segment.kind() as i32,
+                    numbers: segment.asns().collect(),
+                })
+                .collect();
             api::Attribute {
                 attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
                     segments,
@@ -1332,7 +1327,7 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
             }
         }
         Attribute::TUNNEL_ENCAP => {
-            let tlvs = packet::tunnel_encap::decode(a.binary().unwrap());
+            let tlvs = packet::tunnel_encap::decode(&a.binary().unwrap());
             api::Attribute {
                 attr: Some(api::attribute::Attr::TunnelEncap(
                     api::TunnelEncapAttribute {
@@ -1341,7 +1336,7 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 )),
             }
         }
-        Attribute::PREFIX_SID => match prefix_sid::PrefixSid::decode(a.binary().unwrap()) {
+        Attribute::PREFIX_SID => match prefix_sid::PrefixSid::decode(&a.binary().unwrap()) {
             Ok(sid) => api::Attribute {
                 attr: Some(api::attribute::Attr::PrefixSid(prefix_sid_to_api(&sid))),
             },
@@ -1349,12 +1344,12 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
                     flags: a.flags() as u32,
                     r#type: a.code() as u32,
-                    value: a.binary().unwrap().to_owned(),
+                    value: a.binary().unwrap().to_vec(),
                 })),
             },
         },
         Attribute::LS => {
-            let tlvs = ls::parse_ls_attr(a.binary().unwrap());
+            let tlvs = ls::parse_ls_attr(&a.binary().unwrap());
             api::Attribute {
                 attr: Some(api::attribute::Attr::Ls(ls_tlvs_to_api(&tlvs))),
             }
@@ -1363,7 +1358,7 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
             attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
                 flags: a.flags() as u32,
                 r#type: a.code() as u32,
-                value: a.binary().unwrap().to_owned(),
+                value: a.binary().unwrap().to_vec(),
             })),
         },
     }
@@ -1650,7 +1645,7 @@ const EXTCOM_TYPE_GENERIC_TRANSITIVE: u8 = 0x80;
 const EXTCOM_TYPE_GENERIC_TRANSITIVE_IPV4: u8 = 0x81;
 const EXTCOM_TYPE_GENERIC_TRANSITIVE_4OCTET_AS: u8 = 0x82;
 
-fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
+fn read_extcom<T: AsRef<[u8]>>(c: &mut Cursor<T>) -> api::ExtendedCommunity {
     let start = c.position() as usize;
     let type_high = c.read_u8().unwrap();
     let is_transitive = type_high & EXTCOM_TYPE_NON_TRANSITIVE == 0;
@@ -1727,7 +1722,7 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
                 api::extended_community::Extcom::TrafficRemark(api::TrafficRemarkExtended { dscp })
             }
             _ => {
-                let buf = c.get_ref();
+                let buf = c.get_ref().as_ref();
                 let value = buf[start..start + 8].to_vec();
                 c.set_position((start + 8) as u64);
                 api::extended_community::Extcom::Unknown(api::UnknownExtended {
@@ -1748,7 +1743,7 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
                 )
             }
             _ => {
-                let buf = c.get_ref();
+                let buf = c.get_ref().as_ref();
                 let value = buf[start..start + 8].to_vec();
                 c.set_position((start + 8) as u64);
                 api::extended_community::Extcom::Unknown(api::UnknownExtended {
@@ -1766,7 +1761,7 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
                 )
             }
             _ => {
-                let buf = c.get_ref();
+                let buf = c.get_ref().as_ref();
                 let value = buf[start..start + 8].to_vec();
                 c.set_position((start + 8) as u64);
                 api::extended_community::Extcom::Unknown(api::UnknownExtended {
@@ -1777,7 +1772,7 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
         },
         _ => {
             // Copy the full 8-byte chunk so the unknown extcom round-trips.
-            let buf = c.get_ref();
+            let buf = c.get_ref().as_ref();
             let value = buf[start..start + 8].to_vec();
             c.set_position((start + 8) as u64);
             api::extended_community::Extcom::Unknown(api::UnknownExtended {
@@ -5195,7 +5190,7 @@ mod tests {
         assert_eq!(attr.code(), Attribute::MP_REACH);
         let b = attr.binary().unwrap();
         // AFI=1, SAFI=85, NH_LEN=4, nexthop=10.0.0.1, reserved=0
-        assert_eq!(b, &vec![0x00, 0x01, 0x55, 0x04, 10, 0, 0, 1, 0x00]);
+        assert_eq!(b.as_ref(), &vec![0x00, 0x01, 0x55, 0x04, 10, 0, 0, 1, 0x00]);
     }
 
     #[test]
@@ -6669,7 +6664,7 @@ bgp-actions.set-next-hop = "self"
         let attr = attr_from_api(te_attr).unwrap();
         assert_eq!(attr.code(), packet::Attribute::TUNNEL_ENCAP);
         let bytes = attr.binary().unwrap();
-        let tlvs = packet::tunnel_encap::decode(bytes);
+        let tlvs = packet::tunnel_encap::decode(&bytes);
         assert_eq!(tlvs.len(), 1);
         assert_eq!(tlvs[0].tunnel_type, 15);
 

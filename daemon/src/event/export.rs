@@ -852,7 +852,7 @@ pub(super) fn rr_reflect_attrs(
             .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
             .and_then(|a| a.binary())
         {
-            v.extend_from_slice(existing);
+            v.extend_from_slice(&existing);
         }
         v
     };

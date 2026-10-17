@@ -28,6 +28,15 @@ pub struct MalformedAsPath;
 #[derive(Debug, Clone, Copy)]
 pub struct AsPath<'a> {
     bytes: &'a [u8],
+    encoding: Encoding,
+    summary: Option<AsPathSummary>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Encoding {
+    Canonical,
+    #[cfg(feature = "packed-as-paths")]
+    Escaped,
 }
 
 /// Small, on-demand routing summary; policy endpoint matching is distinct.
@@ -52,11 +61,36 @@ impl<'a> AsPath<'a> {
             let size = 2 + usize::from(rest[1]) * 4;
             rest = rest.get(size..).ok_or(MalformedAsPath)?;
         }
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes,
+            encoding: Encoding::Canonical,
+            summary: None,
+        })
+    }
+
+    #[cfg(feature = "packed-as-paths")]
+    pub(crate) fn stored(bytes: &'a [u8], encoding: Encoding, summary: AsPathSummary) -> Self {
+        Self {
+            bytes,
+            encoding,
+            summary: Some(summary),
+        }
+    }
+
+    #[cfg(feature = "packed-as-paths")]
+    pub(crate) fn canonical_bytes(self) -> impl Iterator<Item = u8> + 'a {
+        self.segments().flat_map(|segment| {
+            [segment.kind(), segment.len() as u8]
+                .into_iter()
+                .chain(segment.asns().flat_map(u32::to_be_bytes))
+        })
     }
 
     pub fn segments(self) -> AsPathSegments<'a> {
-        AsPathSegments { rest: self.bytes }
+        AsPathSegments {
+            rest: self.bytes,
+            encoding: self.encoding,
+        }
     }
 
     /// Test presence, not multiplicity. All input was validated at construction,
@@ -67,6 +101,9 @@ impl<'a> AsPath<'a> {
     }
 
     pub fn summary(self) -> AsPathSummary {
+        if let Some(summary) = self.summary {
+            return summary;
+        }
         let mut hop_count = 0;
         let mut origin = None;
         for segment in self.segments() {
@@ -90,6 +127,8 @@ impl<'a> AsPath<'a> {
 pub struct AsPathSegment<'a> {
     kind: u8,
     bytes: &'a [u8],
+    count: usize,
+    encoding: Encoding,
 }
 
 impl<'a> AsPathSegment<'a> {
@@ -98,25 +137,95 @@ impl<'a> AsPathSegment<'a> {
     }
 
     pub fn len(self) -> usize {
-        self.bytes.len() / 4
+        self.count
     }
 
     pub fn is_empty(self) -> bool {
-        self.bytes.is_empty()
+        self.count == 0
     }
 
-    pub fn asns(self) -> impl DoubleEndedIterator<Item = u32> + ExactSizeIterator + 'a {
-        self.bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|bytes| u32::from_be_bytes(*bytes))
+    pub fn asns(self) -> AsPathAsns<'a> {
+        AsPathAsns {
+            bytes: self.bytes,
+            count: self.count,
+            encoding: self.encoding,
+        }
+    }
+}
+
+/// Bounded, allocation-free ASN decoding, retaining repetitions.
+#[derive(Debug, Clone)]
+pub struct AsPathAsns<'a> {
+    bytes: &'a [u8],
+    count: usize,
+    encoding: Encoding,
+}
+
+impl Iterator for AsPathAsns<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.count == 0 {
+            return None;
+        }
+        let (asn, size) = decode(self.bytes, self.encoding);
+        self.bytes = &self.bytes[size..];
+        self.count -= 1;
+        Some(asn)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.count, Some(self.count))
+    }
+}
+
+impl DoubleEndedIterator for AsPathAsns<'_> {
+    fn next_back(&mut self) -> Option<u32> {
+        if self.count == 0 {
+            return None;
+        }
+        let start = match self.encoding {
+            Encoding::Canonical => self.bytes.len() - 4,
+            #[cfg(feature = "packed-as-paths")]
+            Encoding::Escaped => {
+                // Escape payloads can contain zero units. Walk validated ASN
+                // boundaries, never infer an escape by scanning backwards.
+                let mut offset = 0;
+                for _ in 1..self.count {
+                    offset += decode(&self.bytes[offset..], self.encoding).1;
+                }
+                offset
+            }
+        };
+        let asn = decode(&self.bytes[start..], self.encoding).0;
+        self.bytes = &self.bytes[..start];
+        self.count -= 1;
+        Some(asn)
+    }
+}
+
+impl ExactSizeIterator for AsPathAsns<'_> {}
+impl std::iter::FusedIterator for AsPathAsns<'_> {}
+
+fn decode(bytes: &[u8], encoding: Encoding) -> (u32, usize) {
+    match encoding {
+        Encoding::Canonical => (u32::from_be_bytes(bytes[..4].try_into().unwrap()), 4),
+        #[cfg(feature = "packed-as-paths")]
+        Encoding::Escaped => {
+            let unit = u16::from_be_bytes(bytes[..2].try_into().unwrap());
+            if unit != 0 {
+                (u32::from(unit), 2)
+            } else {
+                (u32::from_be_bytes(bytes[2..6].try_into().unwrap()), 6)
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AsPathSegments<'a> {
     rest: &'a [u8],
+    encoding: Encoding,
 }
 
 impl<'a> Iterator for AsPathSegments<'a> {
@@ -127,12 +236,24 @@ impl<'a> Iterator for AsPathSegments<'a> {
             return None;
         }
         // Only AsPath::segments constructs this iterator, after full validation.
-        let size = 2 + usize::from(self.rest[1]) * 4;
+        let count = usize::from(self.rest[1]);
+        let mut size = 2;
+        match self.encoding {
+            Encoding::Canonical => size += count * 4,
+            #[cfg(feature = "packed-as-paths")]
+            Encoding::Escaped => {
+                for _ in 0..count {
+                    size += decode(&self.rest[size..], self.encoding).1;
+                }
+            }
+        }
         let (segment, rest) = self.rest.split_at(size);
         self.rest = rest;
         Some(AsPathSegment {
             kind: segment[0],
             bytes: &segment[2..],
+            count,
+            encoding: self.encoding,
         })
     }
 }
@@ -164,6 +285,7 @@ mod tests {
             (4, &[6, 5]),
         ]);
         let path = attr.as_path().unwrap();
+        #[cfg(not(feature = "packed-as-paths"))]
         assert_eq!(path.bytes.as_ptr(), attr.binary().unwrap().as_ptr());
         let borrowed: Vec<_> = path
             .segments()
@@ -203,6 +325,7 @@ mod tests {
         let full = vec![65001; 255];
         let attr = attribute(&[(2, &full), (2, &full)]);
         assert_eq!(attr.as_path().unwrap().summary().hop_count, 510);
+        assert_eq!(attr.as_path_length(), 510);
     }
 
     #[test]
@@ -239,7 +362,7 @@ mod tests {
         }
         let prefix = attribute(&[(2, &[65001])]);
         for tail in [vec![2], vec![2, 1, 0], vec![5, 0]] {
-            let mut bytes = prefix.binary().unwrap().clone();
+            let mut bytes = prefix.binary().unwrap().to_vec();
             bytes.extend(tail);
             let attr = Attribute::new_with_bin(Attribute::AS_PATH, bytes).unwrap();
             assert!(attr.as_path().is_err());

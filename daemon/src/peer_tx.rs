@@ -27,6 +27,8 @@ type AttrKey = (Arc<Vec<packet::Attribute>>, Option<Nexthop>);
 type ReachValue = (packet::Nlri, Arc<Vec<packet::Attribute>>, Option<Nexthop>);
 
 pub(crate) struct PendingTx {
+    #[cfg(feature = "packed-as-paths")]
+    path_store: packet::as_path_store::AsPathStore,
     // Key is (dest_id, path_id): integer keys hash much cheaper than PathNlri
     // (which embeds the full Nlri enum).  The Nlri is carried in the value and
     // reconstructed into PathNlri only when draining into UPDATE messages.
@@ -42,6 +44,8 @@ pub(crate) struct PendingTx {
 impl PendingTx {
     pub(crate) fn new(addpath_tx: bool) -> Self {
         PendingTx {
+            #[cfg(feature = "packed-as-paths")]
+            path_store: Default::default(),
             reach: FnvHashMap::default(),
             unreach: FnvHashMap::default(),
             pending_eor: false,
@@ -76,6 +80,12 @@ impl PendingTx {
         nexthop: Option<Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
+        #[cfg(feature = "packed-as-paths")]
+        let attr = {
+            let mut attr = attr;
+            self.path_store.intern_attributes(&mut attr);
+            attr
+        };
         let key = (dest_id, if self.addpath_tx { path_id } else { 0 });
         self.unreach.remove(&key);
         self.reach.insert(key, (nlri, attr, nexthop));
@@ -514,5 +524,26 @@ mod tests {
         } else {
             panic!("expected Update");
         }
+    }
+    #[cfg(feature = "packed-as-paths")]
+    #[test]
+    fn independently_stored_equal_paths_still_group_into_one_update() {
+        let make = || Arc::new(vec![bgp::Attribute::empty_as_path().as_path_prepend(65001)]);
+        let a = make();
+        let b = make();
+        assert!(!Arc::ptr_eq(
+            a[0].packed_as_path().unwrap(),
+            b[0].packed_as_path().unwrap()
+        ));
+        assert_eq!(a, b);
+        let mut pending = PendingTx::new(false);
+        pending.reach(1, nlri("10.0.0.0/24"), 0, nh(), a);
+        pending.reach(2, nlri("10.0.1.0/24"), 0, nh(), b);
+        let messages = pending.drain_messages(Family::IPV4);
+        assert_eq!(messages.len(), 1);
+        let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &messages[0] else {
+            panic!()
+        };
+        assert_eq!(entries.len(), 2);
     }
 }

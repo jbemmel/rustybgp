@@ -1,0 +1,5 @@
+operation,median_ns,allocations_per_op,min_ns,max_ns
+store/retained_hit,65.96,0.000,65.69922,69.14421
+store/expired_miss,90.18,2.000,89.97109,90.48829
+store/cached_summary,4.25,0.000,4.2471,4.26619
+store/churn,162.15,3.000,158.95807,165.04497

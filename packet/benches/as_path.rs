@@ -41,6 +41,19 @@ fn main() {
         assert_eq!(owned(), borrowed());
         support::measure(&format!("{name}/owned_decode"), |_| owned(), false);
         support::measure(&format!("{name}/borrowed_decode"), |_| borrowed(), true);
+        support::measure(
+            &format!("{name}/prepend"),
+            |_| {
+                black_box(black_box(&attr).as_path_prepend(65000));
+                1
+            },
+            false,
+        );
+        support::measure(
+            &format!("{name}/wire_encode"),
+            |_| black_box(&attr).encode_to_bytes().len() as u64,
+            false,
+        );
         let targets = [black_box(u32::MAX), black_box(u32::MAX - 1)];
         support::measure(
             &format!("{name}/two_counts_miss"),

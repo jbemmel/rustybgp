@@ -1,0 +1,13 @@
+{
+  "entries": 17476709,
+  "distinct_exact_encodings": 2135078,
+  "canonical_bytes": 47702910,
+  "escaped_bytes": 34971816,
+  "adaptive_bytes": 34075394,
+  "narrow_asns": 8611526,
+  "wide_asns": 2245979,
+  "zero_asns": 0,
+  "max_canonical_bytes": 1036,
+  "extraction_seconds": 32.40645358490292,
+  "corpus_sha256": "7ece1329f2eb2d252f341c316a610f1651b3343036814f5bb41ab320f0b8e7c3"
+}

@@ -119,5 +119,31 @@ fn main() {
             },
             false,
         );
+        // Model an installed route retaining the entry between UPDATEs. The
+        // preceding case deliberately releases every decoded path each time.
+        let held = codec
+            .try_parse(&mut BytesMut::from(wire.as_ref()))
+            .unwrap()
+            .unwrap();
+        let held: Vec<_> = bgp::validate_message(held, true).unwrap().collect();
+        support::measure(
+            &format!("update_retained_path/{name}"),
+            |_| {
+                let mut input = BytesMut::from(black_box(wire.as_ref()));
+                let parsed = codec.try_parse(&mut input).unwrap().unwrap();
+                let mut messages = bgp::validate_message(parsed, true).unwrap();
+                let bgp::Message::Update(bgp::Update::Reach {
+                    attr, mut nexthop, ..
+                }) = messages.next().unwrap()
+                else {
+                    panic!("expected reachable UPDATE");
+                };
+                let (filtered, _) = apply_import(&policy, None, &source, &net, &attr, &mut nexthop);
+                assert_eq!(filtered, name != "only_miss");
+                u64::from(filtered)
+            },
+            false,
+        );
+        black_box(held);
     }
 }

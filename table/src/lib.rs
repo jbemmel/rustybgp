@@ -886,6 +886,8 @@ impl Rib {
 pub const MAX_NUM_SHARDS: usize = 255;
 
 pub struct Table {
+    #[cfg(feature = "packed-as-paths")]
+    path_store: packet::as_path_store::AsPathStore,
     ribs: FnvHashMap<Family, Rib>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, PrefixStats>>,
     shard_idx: u32,
@@ -1210,6 +1212,12 @@ impl Table {
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
         timestamp: u32,
     ) -> InsertResult {
+        #[cfg(feature = "packed-as-paths")]
+        let attr = {
+            let mut attr = attr;
+            self.path_store.intern_attributes(&mut attr);
+            attr
+        };
         let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 }
             | if nexthop_invalid {
                 RibEntry::FLAG_NEXTHOP_INVALID
@@ -2041,6 +2049,8 @@ impl Table {
 
     pub fn new(shard_idx: u32) -> Self {
         Table {
+            #[cfg(feature = "packed-as-paths")]
+            path_store: Default::default(),
             ribs: vec![(Family::EMPTY, Rib::new(shard_idx))]
                 .into_iter()
                 .collect(),

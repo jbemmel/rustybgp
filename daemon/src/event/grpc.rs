@@ -971,7 +971,7 @@ impl GrpcService {
                 bgp::Attribute::NEXTHOP => {
                     nexthop = a
                         .binary()
-                        .and_then(|b| bgp::Nexthop::from_bytes(Family::IPV4, b));
+                        .and_then(|b| bgp::Nexthop::from_bytes(Family::IPV4, &b));
                     if nexthop.is_none() {
                         return Err(tonic::Status::invalid_argument("invalid nexthop"));
                     }

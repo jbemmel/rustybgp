@@ -1899,4 +1899,46 @@ mod tests {
             "shard 1 local_id=0 route must exist"
         );
     }
+    #[cfg(feature = "packed-as-paths")]
+    #[test]
+    fn received_entry_is_shared_by_prefixes_in_both_shards() {
+        let tm = TableManager::new(2);
+        let source = make_peer_source("192.0.2.1", "192.0.2.2", 65002);
+        let attr = Arc::new(vec![bgp::Attribute::empty_as_path().as_path_prepend(65002)]);
+        let entry = attr[0].packed_as_path().unwrap().clone();
+        for i in 0..64u8 {
+            let net = packet::Nlri::V4(bgp::Ipv4Net {
+                addr: Ipv4Addr::new(10, 0, i, 0),
+                mask: 24,
+            });
+            tm.insert_route(
+                source.clone(),
+                Family::IPV4,
+                packet::PathNlri::new(net),
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                attr.clone(),
+                None,
+                0,
+            );
+        }
+        for shard in &tm.shards {
+            let paths = shard
+                .lock()
+                .unwrap()
+                .rtable
+                .collect_loc_rib_paths(&Family::IPV4);
+            assert!(!paths.is_empty());
+            for change in paths {
+                let received = &change.new_best().unwrap().attr;
+                let stored = received
+                    .iter()
+                    .find(|a| a.code() == bgp::Attribute::AS_PATH)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&entry, stored.packed_as_path().unwrap()));
+                assert!(Arc::ptr_eq(&attr, received));
+            }
+        }
+        drop(tm);
+        assert_eq!(entry.as_path().summary().origin, Some(65002));
+    }
 }
